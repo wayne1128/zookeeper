@@ -18,9 +18,12 @@
 
 package org.apache.zookeeper.server.quorum;
 
+import static java.nio.charset.StandardCharsets.UTF_8;
 import java.nio.ByteBuffer;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicReference;
 import org.apache.jute.Record;
+import org.apache.zookeeper.common.Time;
 import org.apache.zookeeper.server.ObserverBean;
 import org.apache.zookeeper.server.Request;
 import org.apache.zookeeper.server.ServerMetrics;
@@ -112,11 +115,14 @@ public class Observer extends Learner {
                     throw new Exception("learned about role change");
                 }
 
+                final long startTime = Time.currentElapsedTime();
                 self.setLeaderAddressAndId(master.addr, master.getId());
                 self.setZabState(QuorumPeer.ZabState.SYNCHRONIZATION);
                 syncWithLeader(newLeaderZxid);
                 self.setZabState(QuorumPeer.ZabState.BROADCAST);
                 completedSync = true;
+                final long syncTime = Time.currentElapsedTime() - startTime;
+                ServerMetrics.getMetrics().OBSERVER_SYNC_TIME.add(syncTime);
                 QuorumPacket qp = new QuorumPacket();
                 while (this.isRunning() && nextLearnerMaster.get() == null) {
                     readPacket(qp);
@@ -196,12 +202,8 @@ public class Observer extends Learner {
         case Leader.INFORM:
             ServerMetrics.getMetrics().LEARNER_COMMIT_RECEIVED_COUNT.add(1);
             logEntry = SerializeUtils.deserializeTxn(qp.getData());
-            hdr = logEntry.getHeader();
-            txn = logEntry.getTxn();
-            digest = logEntry.getDigest();
-            Request request = new Request(hdr.getClientId(), hdr.getCxid(), hdr.getType(), hdr, txn, 0);
+            Request request = logEntry.toRequest();
             request.logLatency(ServerMetrics.getMetrics().COMMIT_PROPAGATION_LATENCY);
-            request.setTxnDigest(digest);
             ObserverZooKeeperServer obs = (ObserverZooKeeperServer) zk;
             obs.commitRequest(request);
             break;
@@ -213,13 +215,10 @@ public class Observer extends Learner {
             byte[] remainingdata = new byte[buffer.remaining()];
             buffer.get(remainingdata);
             logEntry = SerializeUtils.deserializeTxn(remainingdata);
-            hdr = logEntry.getHeader();
             txn = logEntry.getTxn();
-            digest = logEntry.getDigest();
-            QuorumVerifier qv = self.configFromString(new String(((SetDataTxn) txn).getData()));
+            QuorumVerifier qv = self.configFromString(new String(((SetDataTxn) txn).getData(), UTF_8));
 
-            request = new Request(hdr.getClientId(), hdr.getCxid(), hdr.getType(), hdr, txn, 0);
-            request.setTxnDigest(digest);
+            request = logEntry.toRequest();
             obs = (ObserverZooKeeperServer) zk;
 
             boolean majorChange = self.processReconfig(qv, suggestedLeaderId, qp.getZxid(), true);
@@ -254,7 +253,7 @@ public class Observer extends Learner {
 
     private static void waitForReconnectDelayHelper(long delayValueMs) {
         if (delayValueMs > 0) {
-            long randomDelay = (long) (delayValueMs * Math.random());
+            long randomDelay = ThreadLocalRandom.current().nextLong(delayValueMs);
             LOG.info("Waiting for {} ms before reconnecting with the leader", randomDelay);
             try {
                 Thread.sleep(randomDelay);

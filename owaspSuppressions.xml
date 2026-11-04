@@ -19,8 +19,30 @@
 
 <suppressions xmlns="https://jeremylong.github.io/DependencyCheck/dependency-suppression.1.2.xsd">
    <suppress>
+      <notes>False positive: it affects only opentelemetry-js: the OpenTelemetry JavaScript Client</notes>
+      <cve>CVE-2026-54285</cve>
+   </suppress>
+   <suppress>
+      <notes>False positive: it affects only OpenTelemetry dotnet library</notes>
+      <cve>CVE-2026-41078</cve>
+      <cve>CVE-2026-40894</cve>
+   </suppress>
+   <suppress>
+      <notes>False positive: it affects only OpenTelemetry-Go: the Go implementation of OpenTelemetry</notes>
+      <cve>CVE-2026-39882</cve>
+      <cve>CVE-2026-41178</cve>
+   </suppress>
+   <suppress>
+      <notes>False positive: it affects only OpenTelemetry-cpp: the C++ implementation of OpenTelemetry</notes>
+      <cve>CVE-2026-44967</cve>
+   </suppress>
+   <suppress>
       <!-- ZOOKEEPER-3217 -->
       <cve>CVE-2018-8088</cve>
+   </suppress>
+   <suppress>
+      <!-- ZOOKEEPER-4660 -->
+      <cve>CVE-2021-37533</cve>
    </suppress>
    <suppress>
       <!-- ZOOKEEPER-3262 -->
@@ -34,21 +56,36 @@
       <!-- https://github.com/jeremylong/DependencyCheck/issues/1653
            False positive on Netty 4.x-->
       <cve>CVE-2018-12056</cve>
+      <!-- ZOOKEEPER-4755: looks like a real vulnerability in Netty,
+           but no report or patch has been published so far.  This has
+           to be monitored and will probably have to be remediated.
+
+           https://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-2023-4586
+      -->
+      <cve>CVE-2023-4586</cve>
    </suppress>
    <suppress>
       <!-- Seems like false positive - we are not using Prometheus
-           2.x, rather the client which lastest is 0.6. at the time of
+           2.x, rather the client which latest is 0.6. at the time of
            this writing  -->
       <cve>CVE-2019-3826</cve>
    </suppress>
+
+ 
    <suppress>
-      <!-- false positive for us, it is about log4j server in log4j-1.2.17.jar
-           ZOOKEEPER-3677 -->
-      <cve>CVE-2019-17571</cve>
+      <!-- Seems like false positives about zookeeper-jute -->
+      <cve>CVE-2021-29425</cve>
    </suppress>
+
    <suppress>
-      <!-- it only affects the log4j SmtpAppender users. As Log4J 1.2 is EOL now, we can't fix this unless we
-           upgrade to log4j 2. See ZOOKEEPER-3817 -->
-      <cve>CVE-2020-9488</cve>
+      <!-- ZOOKEEPER-4716: jackson related false positives -->
+
+      <!-- according to jackson community, this is not a security issue,
+           see: https://github.com/FasterXML/jackson-databind/issues/3972#issuecomment-1596193098 -->
+      <cve>CVE-2023-35116</cve>
+
+      <!-- the following CVE is not even jackson related, but a vulnerability
+           in json-java which we don't use in ZooKeeper -->
+      <cve>CVE-2022-45688</cve>
    </suppress>
 </suppressions>

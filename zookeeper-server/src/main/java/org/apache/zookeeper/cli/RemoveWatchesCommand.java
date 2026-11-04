@@ -19,10 +19,9 @@
 package org.apache.zookeeper.cli;
 
 import org.apache.commons.cli.CommandLine;
+import org.apache.commons.cli.DefaultParser;
 import org.apache.commons.cli.Options;
 import org.apache.commons.cli.ParseException;
-import org.apache.commons.cli.Parser;
-import org.apache.commons.cli.PosixParser;
 import org.apache.zookeeper.KeeperException;
 import org.apache.zookeeper.Watcher.WatcherType;
 
@@ -38,6 +37,8 @@ public class RemoveWatchesCommand extends CliCommand {
     static {
         options.addOption("c", false, "child watcher type");
         options.addOption("d", false, "data watcher type");
+        options.addOption("p", false, "persistent watcher type");
+        options.addOption("r", false, "persistent recursive watcher type");
         options.addOption("a", false, "any watcher type");
         options.addOption("l", false, "remove locally when there is no server connection");
     }
@@ -48,7 +49,7 @@ public class RemoveWatchesCommand extends CliCommand {
 
     @Override
     public CliCommand parse(String[] cmdArgs) throws CliParseException {
-        Parser parser = new PosixParser();
+        DefaultParser parser = new DefaultParser();
         try {
             cl = parser.parse(options, cmdArgs);
         } catch (ParseException ex) {
@@ -71,6 +72,10 @@ public class RemoveWatchesCommand extends CliCommand {
             wtype = WatcherType.Children;
         } else if (cl.hasOption("d")) {
             wtype = WatcherType.Data;
+        } else if (cl.hasOption("p")) {
+            wtype = WatcherType.Persistent;
+        } else if (cl.hasOption("r")) {
+            wtype = WatcherType.PersistentRecursive;
         } else if (cl.hasOption("a")) {
             wtype = WatcherType.Any;
         }

@@ -19,22 +19,41 @@
 package org.apache.zookeeper.server.persistence;
 
 import static org.hamcrest.CoreMatchers.containsString;
+import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.core.IsNot.not;
-import static org.junit.Assert.assertThat;
-import static org.junit.Assert.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.PrintStream;
+import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Scanner;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import org.apache.commons.io.FileUtils;
+import org.apache.jute.BinaryOutputArchive;
+import org.apache.jute.Record;
+import org.apache.zookeeper.KeeperException;
+import org.apache.zookeeper.ZooDefs;
 import org.apache.zookeeper.test.ClientBase;
-import org.junit.After;
-import org.junit.Before;
-import org.junit.Test;
+import org.apache.zookeeper.txn.CheckVersionTxn;
+import org.apache.zookeeper.txn.CreateContainerTxn;
+import org.apache.zookeeper.txn.CreateTTLTxn;
+import org.apache.zookeeper.txn.CreateTxn;
+import org.apache.zookeeper.txn.DeleteTxn;
+import org.apache.zookeeper.txn.ErrorTxn;
+import org.apache.zookeeper.txn.MultiTxn;
+import org.apache.zookeeper.txn.SetDataTxn;
+import org.apache.zookeeper.txn.Txn;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
 
 public class TxnLogToolkitTest {
 
@@ -44,7 +63,7 @@ public class TxnLogToolkitTest {
     private final ByteArrayOutputStream errContent = new ByteArrayOutputStream();
     private File mySnapDir;
 
-    @Before
+    @BeforeEach
     public void setUp() throws IOException {
         System.setOut(new PrintStream(outContent));
         System.setErr(new PrintStream(errContent));
@@ -53,7 +72,7 @@ public class TxnLogToolkitTest {
         FileUtils.copyDirectory(snapDir, mySnapDir);
     }
 
-    @After
+    @AfterEach
     public void tearDown() throws IOException {
         System.setOut(System.out);
         System.setErr(System.err);
@@ -74,20 +93,53 @@ public class TxnLogToolkitTest {
         // no exception thrown
     }
 
-    @Test(expected = TxnLogToolkit.TxnLogToolkitException.class)
+    @Test
     public void testInitMissingFile() throws FileNotFoundException, TxnLogToolkit.TxnLogToolkitException {
-        // Arrange & Act
-        File logfile = new File("this_file_should_not_exists");
-        TxnLogToolkit lt = new TxnLogToolkit(false, false, logfile.toString(), true);
+        assertThrows(TxnLogToolkit.TxnLogToolkitException.class, () -> {
+            // Arrange & Act
+            File logfile = new File("this_file_should_not_exists");
+            TxnLogToolkit lt = new TxnLogToolkit(false, false, logfile.toString(), true);
+        });
     }
 
-    @Test(expected = TxnLogToolkit.TxnLogToolkitException.class)
-    public void testInitWithRecoveryFileExists() throws IOException, TxnLogToolkit.TxnLogToolkitException {
-        // Arrange & Act
-        File logfile = new File(new File(mySnapDir, "version-2"), "log.274");
-        File recoveryFile = new File(new File(mySnapDir, "version-2"), "log.274.fixed");
-        recoveryFile.createNewFile();
-        TxnLogToolkit lt = new TxnLogToolkit(true, false, logfile.toString(), true);
+    @Test
+    public void testMultiTxnDecode() throws IOException {
+        // MultiTxn with multi ops including errors
+        List<Txn> txns = new ArrayList<>();
+        txns.add(newSubTxn(ZooDefs.OpCode.error, new ErrorTxn(KeeperException.Code.NONODE.intValue())));
+        txns.add(newSubTxn(ZooDefs.OpCode.error, new ErrorTxn(KeeperException.Code.RUNTIMEINCONSISTENCY.intValue())));
+        txns.add(newSubTxn(ZooDefs.OpCode.create, new CreateTxn("/test", "test-data".getBytes(StandardCharsets.UTF_8), ZooDefs.Ids.OPEN_ACL_UNSAFE, true, 1)));
+        txns.add(newSubTxn(ZooDefs.OpCode.createContainer, new CreateContainerTxn("/test_container", "test-data".getBytes(StandardCharsets.UTF_8), ZooDefs.Ids.OPEN_ACL_UNSAFE, 2)));
+        txns.add(newSubTxn(ZooDefs.OpCode.createTTL, new CreateTTLTxn("/test_container", "test-data".getBytes(StandardCharsets.UTF_8), ZooDefs.Ids.OPEN_ACL_UNSAFE, 2, 20)));
+        txns.add(newSubTxn(ZooDefs.OpCode.setData, new SetDataTxn("/test_set_data", "test-data".getBytes(StandardCharsets.UTF_8), 4)));
+        txns.add(newSubTxn(ZooDefs.OpCode.delete, new DeleteTxn("/test_delete")));
+        txns.add(newSubTxn(ZooDefs.OpCode.check, new CheckVersionTxn("/test_check_version", 5)));
+        MultiTxn multiTxn = new MultiTxn(txns);
+        String formattedTxnStr = TxnLogToolkit.getFormattedTxnStr(multiTxn);
+        assertEquals("error:-101;error:-2;create:/test,test-data,[31,s{'world,'anyone}\n"
+                    + "],true,1;createContainer:/test_container,test-data,[31,s{'world,'anyone}\n"
+                    + "],2;createTTL:/test_container,test-data,[31,s{'world,'anyone}\n"
+                    + "],2,20;setData:/test_set_data,test-data,4;delete:/test_delete;check:/test_check_version,5", formattedTxnStr);
+    }
+
+    private static Txn newSubTxn(int type, Record record) throws IOException {
+        try (ByteArrayOutputStream baos = new ByteArrayOutputStream()) {
+            BinaryOutputArchive boa = BinaryOutputArchive.getArchive(baos);
+            record.serialize(boa, "request");
+            ByteBuffer bb = ByteBuffer.wrap(baos.toByteArray());
+            return new Txn(type, bb.array());
+        }
+    }
+
+    @Test
+    public void testInitWithRecoveryFileExists() {
+        assertThrows(TxnLogToolkit.TxnLogToolkitException.class, () -> {
+            // Arrange & Act
+            File logfile = new File(new File(mySnapDir, "version-2"), "log.274");
+            File recoveryFile = new File(new File(mySnapDir, "version-2"), "log.274.fixed");
+            recoveryFile.createNewFile();
+            TxnLogToolkit lt = new TxnLogToolkit(true, false, logfile.toString(), true);
+        });
     }
 
     @Test
@@ -103,7 +155,7 @@ public class TxnLogToolkitTest {
         String output = outContent.toString();
         Pattern p = Pattern.compile("^CRC ERROR.*session 0x8061fac5ddeb0000 cxid 0x0 zxid 0x8800000002 createSession 30000$", Pattern.MULTILINE);
         Matcher m = p.matcher(output);
-        assertTrue("Output doesn't indicate CRC error for the broken session id: " + output, m.find());
+        assertTrue(m.find(), "Output doesn't indicate CRC error for the broken session id: " + output);
     }
 
     @Test

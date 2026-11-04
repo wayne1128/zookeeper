@@ -23,6 +23,7 @@ import java.io.IOException;
 import java.io.InputStreamReader;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
+import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -32,6 +33,8 @@ import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 import java.util.NoSuchElementException;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Stream;
@@ -43,8 +46,8 @@ import org.apache.zookeeper.cli.CommandFactory;
 import org.apache.zookeeper.cli.CommandNotFoundException;
 import org.apache.zookeeper.cli.MalformedCommandException;
 import org.apache.zookeeper.client.ZKClientConfig;
+import org.apache.zookeeper.common.ConfigException;
 import org.apache.zookeeper.server.ExitCode;
-import org.apache.zookeeper.server.quorum.QuorumPeerConfig;
 import org.apache.zookeeper.util.ServiceUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -57,28 +60,38 @@ import org.slf4j.LoggerFactory;
 public class ZooKeeperMain {
 
     private static final Logger LOG = LoggerFactory.getLogger(ZooKeeperMain.class);
-    static final Map<String, String> commandMap = new HashMap<String, String>();
-    static final Map<String, CliCommand> commandMapCli = new HashMap<String, CliCommand>();
+    static final Map<String, String> commandMap = new HashMap<>();
+    static final Map<String, CliCommand> commandMapCli = new HashMap<>();
 
     protected MyCommandOptions cl = new MyCommandOptions();
-    protected HashMap<Integer, String> history = new HashMap<Integer, String>();
+    protected HashMap<Integer, String> history = new HashMap<>();
     protected int commandCount = 0;
     protected boolean printWatches = true;
     protected int exitCode = ExitCode.EXECUTION_FINISHED.getValue();
 
     protected ZooKeeper zk;
     protected String host = "";
+    private CountDownLatch connectLatch = null;
 
     public boolean getPrintWatches() {
         return printWatches;
     }
 
+    private static final String CMD_CONNECT = "connect";
+    private static final String CMD_HISTORY = "history";
+    private static final String CMD_REDO = "redo";
+    private static final String CMD_QUIT = "quit";
+    private static final String CMD_EXIT = "exit";
+    private static final String CMD_PRINT_WATCHES = "printwatches";
+
+
     static {
-        commandMap.put("connect", "host:port");
-        commandMap.put("history", "");
-        commandMap.put("redo", "cmdno");
-        commandMap.put("printwatches", "on|off");
-        commandMap.put("quit", "");
+        commandMap.put(CMD_CONNECT, "host:port");
+        commandMap.put(CMD_HISTORY, "");
+        commandMap.put(CMD_REDO, "cmdno");
+        commandMap.put(CMD_PRINT_WATCHES, "on|off");
+        commandMap.put(CMD_QUIT, "");
+        commandMap.put(CMD_EXIT, "");
         Stream.of(CommandFactory.Command.values())
             .map(command -> CommandFactory.getInstance(command))
             // add all commands to commandMapCli and commandMap
@@ -92,7 +105,7 @@ public class ZooKeeperMain {
 
     static void usage() {
         System.err.println("ZooKeeper -server host:port -client-configuration properties-file cmd args");
-        List<String> cmdList = new ArrayList<String>(commandMap.keySet());
+        List<String> cmdList = new ArrayList<>(commandMap.keySet());
         Collections.sort(cmdList);
         for (String cmd : cmdList) {
             System.err.println("\t" + cmd + " " + commandMap.get(cmd));
@@ -106,6 +119,13 @@ public class ZooKeeperMain {
                 ZooKeeperMain.printMessage("WATCHER::");
                 ZooKeeperMain.printMessage(event.toString());
             }
+            if (connectLatch != null) {
+                // connection success
+                if (event.getType() == Event.EventType.None
+                    && event.getState() == Event.KeeperState.SyncConnected) {
+                    connectLatch.countDown();
+                }
+            }
         }
 
     }
@@ -116,7 +136,7 @@ public class ZooKeeperMain {
      */
     static class MyCommandOptions {
 
-        private Map<String, String> options = new HashMap<String, String>();
+        private Map<String, String> options = new HashMap<>();
         private List<String> cmdArgs = null;
         private String command = null;
         public static final Pattern ARGS_PATTERN = Pattern.compile("\\s*([^\"\']\\S*|\"[^\"]*\"|'[^']*')\\s*");
@@ -168,6 +188,8 @@ public class ZooKeeperMain {
                         options.put("readonly", "true");
                     } else if (opt.equals("-client-configuration")) {
                         options.put("client-configuration", it.next());
+                    } else if (opt.equals("-waitforconnection")) {
+                        options.put("waitforconnection", "true");
                     }
                 } catch (NoSuchElementException e) {
                     System.err.println("Error: no argument found for option " + opt);
@@ -176,7 +198,7 @@ public class ZooKeeperMain {
 
                 if (!opt.startsWith("-")) {
                     command = opt;
-                    cmdArgs = new ArrayList<String>();
+                    cmdArgs = new ArrayList<>();
                     cmdArgs.add(command);
                     while (it.hasNext()) {
                         cmdArgs.add(it.next());
@@ -195,7 +217,7 @@ public class ZooKeeperMain {
         public boolean parseCommand(String cmdstring) {
             Matcher matcher = ARGS_PATTERN.matcher(cmdstring);
 
-            List<String> args = new LinkedList<String>();
+            List<String> args = new LinkedList<>();
             while (matcher.find()) {
                 String value = matcher.group(1);
                 if (QUOTED_PATTERN.matcher(value).matches()) {
@@ -225,7 +247,7 @@ public class ZooKeeperMain {
     }
 
     public static List<String> getCommands() {
-        List<String> cmdList = new ArrayList<String>(commandMap.keySet());
+        List<String> cmdList = new ArrayList<>(commandMap.keySet());
         Collections.sort(cmdList);
         return cmdList;
     }
@@ -254,14 +276,26 @@ public class ZooKeeperMain {
 
         if (cl.getOption("client-configuration") != null) {
             try {
-                clientConfig = new ZKClientConfig(cl.getOption("client-configuration"));
-            } catch (QuorumPeerConfig.ConfigException e) {
+                clientConfig = new ZKClientConfig(Paths.get(cl.getOption("client-configuration")));
+            } catch (ConfigException e) {
                 e.printStackTrace();
                 ServiceUtils.requestSystemExit(ExitCode.INVALID_INVOCATION.getValue());
             }
         }
 
-        zk = new ZooKeeperAdmin(host, Integer.parseInt(cl.getOption("timeout")), new MyWatcher(), readOnly, clientConfig);
+        if (cl.getOption("waitforconnection") != null) {
+            connectLatch = new CountDownLatch(1);
+        }
+
+        int timeout = Integer.parseInt(cl.getOption("timeout"));
+        zk = new ZooKeeperAdmin(host, timeout, new MyWatcher(), readOnly, clientConfig);
+        if (connectLatch != null) {
+            if (!connectLatch.await(timeout, TimeUnit.MILLISECONDS)) {
+                zk.close();
+                throw new IOException(KeeperException.create(KeeperException.Code.CONNECTIONLOSS));
+            }
+        }
+
     }
 
     public static void main(String[] args) throws IOException, InterruptedException {
@@ -283,23 +317,22 @@ public class ZooKeeperMain {
         if (cl.getCommand() == null) {
             System.out.println("Welcome to ZooKeeper!");
 
-            boolean jlinemissing = false;
+            boolean jlinemissing = true;
             // only use jline if it's in the classpath
             try {
-                Class<?> consoleC = Class.forName("jline.console.ConsoleReader");
-                Class<?> completorC = Class.forName("org.apache.zookeeper.JLineZNodeCompleter");
+                Class<?> readerC = Class.forName("org.jline.reader.LineReader");
+                Class<?> completerC = Class.forName("org.apache.zookeeper.JLineZNodeCompleter");
 
+                jlinemissing = false;
                 System.out.println("JLine support is enabled");
 
-                Object console = consoleC.getConstructor().newInstance();
-
-                Object completor = completorC.getConstructor(ZooKeeper.class).newInstance(zk);
-                Method addCompletor = consoleC.getMethod("addCompleter", Class.forName("jline.console.completer.Completer"));
-                addCompletor.invoke(console, completor);
+                Object completer = completerC.getConstructor(ZooKeeper.class).newInstance(zk);
+                Object terminal = createTerminal();
+                Object reader = createLineReader(terminal, completer);
 
                 String line;
-                Method readLine = consoleC.getMethod("readLine", String.class);
-                while ((line = (String) readLine.invoke(console, getPrompt())) != null) {
+                Method readLine = readerC.getMethod("readLine", String.class);
+                while ((line = (String) readLine.invoke(reader, getPrompt())) != null) {
                     executeLine(line);
                 }
             } catch (ClassNotFoundException
@@ -308,8 +341,9 @@ public class ZooKeeperMain {
                 | IllegalAccessException
                 | InstantiationException e
             ) {
-                LOG.debug("Unable to start jline", e);
-                jlinemissing = true;
+                if (jlinemissing) {
+                    LOG.debug("Unable to start jline", e);
+                }
             }
 
             if (jlinemissing) {
@@ -326,6 +360,26 @@ public class ZooKeeperMain {
             processCmd(cl);
         }
         ServiceUtils.requestSystemExit(exitCode);
+    }
+
+    private static Object createTerminal() throws ClassNotFoundException, NoSuchMethodException, IllegalAccessException, InvocationTargetException {
+        Class<?> terminalBuilderC = Class.forName("org.jline.terminal.TerminalBuilder");
+        Method terminalBuilderMethod = terminalBuilderC.getMethod("builder");
+        Object terminalBuilder = terminalBuilderMethod.invoke(null);
+        Method terminalBuildMethod = terminalBuilderC.getMethod("build");
+        return terminalBuildMethod.invoke(terminalBuilder);
+    }
+
+    private static Object createLineReader(Object terminal, Object completer) throws ClassNotFoundException, NoSuchMethodException, IllegalAccessException, InvocationTargetException {
+        Class<?> readerBuilderC = Class.forName("org.jline.reader.LineReaderBuilder");
+        Method readerBuilderMethod = readerBuilderC.getMethod("builder");
+        Object readerBuilder = readerBuilderMethod.invoke(null);
+        Method setTerminalMethod = readerBuilderC.getMethod("terminal", Class.forName("org.jline.terminal.Terminal"));
+        setTerminalMethod.invoke(readerBuilder, terminal);
+        Method setCompleterMethod = readerBuilderC.getMethod("completer", Class.forName("org.jline.reader.Completer"));
+        setCompleterMethod.invoke(readerBuilder, completer);
+        Method readerBuildMethod = readerBuilderC.getMethod("build");
+        return readerBuildMethod.invoke(readerBuilder);
     }
 
     public void executeLine(String line) throws InterruptedException, IOException {
@@ -366,34 +420,34 @@ public class ZooKeeperMain {
 
         LOG.debug("Processing {}", cmd);
 
-        if (cmd.equals("quit")) {
+        if (cmd.equals(CMD_QUIT) || cmd.equals(CMD_EXIT)) {
             zk.close();
             ServiceUtils.requestSystemExit(exitCode);
-        } else if (cmd.equals("redo") && args.length >= 2) {
+        } else if (cmd.equals(CMD_REDO) && args.length >= 2) {
             Integer i = Integer.decode(args[1]);
             if (commandCount <= i || i < 0) { // don't allow redoing this redo
                 throw new MalformedCommandException("Command index out of range");
             }
             cl.parseCommand(history.get(i));
-            if (cl.getCommand().equals("redo")) {
+            if (cl.getCommand().equals(CMD_REDO)) {
                 throw new MalformedCommandException("No redoing redos");
             }
             history.put(commandCount, history.get(i));
             processCmd(cl);
-        } else if (cmd.equals("history")) {
+        } else if (cmd.equals(CMD_HISTORY)) {
             for (int i = commandCount - 10; i <= commandCount; ++i) {
                 if (i < 0) {
                     continue;
                 }
                 System.out.println(i + " - " + history.get(i));
             }
-        } else if (cmd.equals("printwatches")) {
+        } else if (cmd.equals(CMD_PRINT_WATCHES)) {
             if (args.length == 1) {
                 System.out.println("printwatches is " + (printWatches ? "on" : "off"));
             } else {
                 printWatches = args[1].equals("on");
             }
-        } else if (cmd.equals("connect")) {
+        } else if (cmd.equals(CMD_CONNECT)) {
             if (args.length >= 2) {
                 connectToZK(args[1]);
             } else {

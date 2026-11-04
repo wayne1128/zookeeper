@@ -18,13 +18,15 @@
 
 package org.apache.zookeeper;
 
-import static org.junit.Assert.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.mockito.Mockito.doReturn;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import org.apache.zookeeper.client.ZKClientConfig;
-import org.junit.Test;
+import org.junit.jupiter.api.Test;
 
 public class ClientCanonicalizeTest extends ZKTestCase {
 
@@ -40,7 +42,7 @@ public class ClientCanonicalizeTest extends ZKTestCase {
 
         ZKClientConfig conf = new ZKClientConfig();
         String principal = SaslServerPrincipal.getServerPrincipal(addr, conf);
-        assertEquals("The computed principal does not appear to have been canonicalized", "zookeeper/zk1.apache.org", principal);
+        assertEquals("zookeeper/zk1.apache.org", principal, "The computed principal does not appear to have been canonicalized");
     }
 
     @Test
@@ -56,7 +58,7 @@ public class ClientCanonicalizeTest extends ZKTestCase {
         ZKClientConfig conf = new ZKClientConfig();
         conf.setProperty(ZKClientConfig.ZK_SASL_CLIENT_CANONICALIZE_HOSTNAME, "false");
         String principal = SaslServerPrincipal.getServerPrincipal(addr, conf);
-        assertEquals("The computed principal does appears to have been canonicalized incorrectly", "zookeeper/zookeeper.apache.org", principal);
+        assertEquals("zookeeper/zookeeper.apache.org", principal, "The computed principal does appears to have been canonicalized incorrectly");
     }
 
     @Test
@@ -71,7 +73,7 @@ public class ClientCanonicalizeTest extends ZKTestCase {
 
         ZKClientConfig conf = new ZKClientConfig();
         String principal = SaslServerPrincipal.getServerPrincipal(addr, conf);
-        assertEquals("The computed principal does appear to have falled back to the original host name", "zookeeper/zookeeper.apache.org", principal);
+        assertEquals("zookeeper/zookeeper.apache.org", principal, "The computed principal does appear to have falled back to the original host name");
     }
 
     @Test
@@ -85,4 +87,39 @@ public class ClientCanonicalizeTest extends ZKTestCase {
         assertEquals(configuredPrincipal, serverPrincipal);
     }
 
+    @Test
+    public void testAllowReverseDnsLookupDisabled() {
+        // Arrange
+        ZKClientConfig config = new ZKClientConfig();
+        config.setProperty(ZKClientConfig.ZK_SASL_CLIENT_ALLOW_REVERSE_DNS, "false");
+        InetSocketAddress addr = mock(InetSocketAddress.class);
+        SaslServerPrincipal.WrapperInetSocketAddress ia = new SaslServerPrincipal.WrapperInetSocketAddress(addr, config);
+        doReturn("this-is-the-right-hostname").when(addr).getHostString();
+        doThrow(new UnsupportedOperationException("getHostName() should not be called when reverse DNS is disabled"))
+            .when(addr).getHostName();
+
+        // Act
+        String hostname = ia.getHostName();
+
+        // Assert
+        assertEquals("this-is-the-right-hostname", hostname);
+    }
+
+    @Test
+    public void testAllowReverseDnsLookupEnabled() {
+        // Arrange
+        ZKClientConfig config = new ZKClientConfig();
+        config.setProperty(ZKClientConfig.ZK_SASL_CLIENT_ALLOW_REVERSE_DNS, "true");
+        InetSocketAddress addr = mock(InetSocketAddress.class);
+        SaslServerPrincipal.WrapperInetSocketAddress ia = new SaslServerPrincipal.WrapperInetSocketAddress(addr, config);
+        doReturn("this-is-the-right-hostname").when(addr).getHostName();
+        doThrow(new UnsupportedOperationException("getHostString() should not be called when reverse DNS is enabled"))
+            .when(addr).getHostString();
+
+        // Act
+        String hostname = ia.getHostName();
+
+        // Assert
+        assertEquals("this-is-the-right-hostname", hostname);
+    }
 }

@@ -18,14 +18,13 @@
 
 package org.apache.zookeeper.server;
 
+import static java.nio.charset.StandardCharsets.UTF_8;
 import java.io.IOException;
-import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
 import java.util.Set;
-import org.apache.commons.lang.StringUtils;
 import org.apache.jute.Record;
 import org.apache.zookeeper.ClientCnxn;
 import org.apache.zookeeper.KeeperException;
@@ -50,6 +49,7 @@ import org.apache.zookeeper.common.Time;
 import org.apache.zookeeper.data.ACL;
 import org.apache.zookeeper.data.Id;
 import org.apache.zookeeper.data.Stat;
+import org.apache.zookeeper.metrics.Counter;
 import org.apache.zookeeper.proto.AddWatchRequest;
 import org.apache.zookeeper.proto.CheckWatchesRequest;
 import org.apache.zookeeper.proto.Create2Response;
@@ -77,8 +77,10 @@ import org.apache.zookeeper.proto.SetWatches;
 import org.apache.zookeeper.proto.SetWatches2;
 import org.apache.zookeeper.proto.SyncRequest;
 import org.apache.zookeeper.proto.SyncResponse;
+import org.apache.zookeeper.proto.WhoAmIResponse;
 import org.apache.zookeeper.server.DataTree.ProcessTxnResult;
 import org.apache.zookeeper.server.quorum.QuorumZooKeeperServer;
+import org.apache.zookeeper.server.util.AuthUtil;
 import org.apache.zookeeper.server.util.RequestPathMetricsCollector;
 import org.apache.zookeeper.txn.ErrorTxn;
 import org.slf4j.Logger;
@@ -212,6 +214,7 @@ public class FinalRequestProcessor implements RequestProcessor {
             switch (request.type) {
             case OpCode.ping: {
                 lastOp = "PING";
+                incrementOpCount(ServerMetrics.getMetrics().OP_COUNT_PING);
                 updateStats(request, lastOp, lastZxid);
 
                 responseSize = cnxn.sendResponse(new ReplyHeader(ClientCnxn.PING_XID, lastZxid, 0), null, "response");
@@ -219,6 +222,7 @@ public class FinalRequestProcessor implements RequestProcessor {
             }
             case OpCode.createSession: {
                 lastOp = "SESS";
+                incrementOpCount(ServerMetrics.getMetrics().OP_COUNT_CREATE_SESSION);
                 updateStats(request, lastOp, lastZxid);
 
                 zks.finishSessionInit(request.cnxn, true);
@@ -226,6 +230,7 @@ public class FinalRequestProcessor implements RequestProcessor {
             }
             case OpCode.multi: {
                 lastOp = "MULT";
+                incrementOpCount(ServerMetrics.getMetrics().OP_COUNT_MULTI);
                 rsp = new MultiResponse();
 
                 for (ProcessTxnResult subTxnResult : rc.multiResult) {
@@ -268,22 +273,43 @@ public class FinalRequestProcessor implements RequestProcessor {
             }
             case OpCode.multiRead: {
                 lastOp = "MLTR";
-                MultiOperationRecord multiReadRecord = new MultiOperationRecord();
-                ByteBufferInputStream.byteBuffer2Record(request.request, multiReadRecord);
+                incrementOpCount(ServerMetrics.getMetrics().OP_COUNT_MULTI_READ);
+                MultiOperationRecord multiReadRecord = request.readRequestRecord(MultiOperationRecord::new);
+
+                // Guard against multiRead response-amplification DoS. A multiRead request
+                // can be tiny on the wire (and thus pass jute.maxbuffer and the large-request
+                // throttle, which only bound the inbound request) yet force the server to
+                // materialize an unbounded response in heap: every sub-op result is copied and
+                // held in the MultiResponse before serialization. Cap the operation count and
+                // the cumulative response size so the response stays bounded.
+                final int maxOps = zks.getMultiReadMaxOps();
+                if (maxOps > 0 && multiReadRecord.size() > maxOps) {
+                    throw new KeeperException.BadArgumentsException(
+                        "multiRead operation count " + multiReadRecord.size()
+                        + " exceeds the configured maximum of " + maxOps);
+                }
+                final long maxResponseBytes = zks.getMultiReadMaxResponseBytes();
+                long responseBytes = 0;
+
                 rsp = new MultiResponse();
                 OpResult subResult;
                 for (Op readOp : multiReadRecord) {
+                    long opBytes = 0;
                     try {
                         Record rec;
                         switch (readOp.getType()) {
                         case OpCode.getChildren:
                             rec = handleGetChildrenRequest(readOp.toRequestRecord(), cnxn, request.authInfo);
-                            subResult = new GetChildrenResult(((GetChildrenResponse) rec).getChildren());
+                            List<String> children = ((GetChildrenResponse) rec).getChildren();
+                            opBytes = childrenSizeInBytes(children);
+                            subResult = new GetChildrenResult(children);
                             break;
                         case OpCode.getData:
                             rec = handleGetDataRequest(readOp.toRequestRecord(), cnxn, request.authInfo);
                             GetDataResponse gdr = (GetDataResponse) rec;
-                            subResult = new GetDataResult(gdr.getData(), gdr.getStat());
+                            byte[] data = gdr.getData();
+                            opBytes = data == null ? 0 : data.length;
+                            subResult = new GetDataResult(data, gdr.getStat());
                             break;
                         default:
                             throw new IOException("Invalid type of readOp");
@@ -291,12 +317,21 @@ public class FinalRequestProcessor implements RequestProcessor {
                     } catch (KeeperException e) {
                         subResult = new ErrorResult(e.code().intValue());
                     }
+                    if (maxResponseBytes > 0) {
+                        responseBytes += opBytes;
+                        if (responseBytes > maxResponseBytes) {
+                            throw new KeeperException.BadArgumentsException(
+                                "multiRead response size exceeds the configured maximum of "
+                                + maxResponseBytes + " bytes");
+                        }
+                    }
                     ((MultiResponse) rsp).add(subResult);
                 }
                 break;
             }
             case OpCode.create: {
                 lastOp = "CREA";
+                incrementOpCount(ServerMetrics.getMetrics().OP_COUNT_CREATE);
                 rsp = new CreateResponse(rc.path);
                 err = Code.get(rc.err);
                 requestPathMetricsCollector.registerRequest(request.type, rc.path);
@@ -306,6 +341,7 @@ public class FinalRequestProcessor implements RequestProcessor {
             case OpCode.createTTL:
             case OpCode.createContainer: {
                 lastOp = "CREA";
+                incrementOpCount(ServerMetrics.getMetrics().OP_COUNT_CREATE);
                 rsp = new Create2Response(rc.path, rc.stat);
                 err = Code.get(rc.err);
                 requestPathMetricsCollector.registerRequest(request.type, rc.path);
@@ -314,12 +350,14 @@ public class FinalRequestProcessor implements RequestProcessor {
             case OpCode.delete:
             case OpCode.deleteContainer: {
                 lastOp = "DELE";
+                incrementOpCount(ServerMetrics.getMetrics().OP_COUNT_DELETE);
                 err = Code.get(rc.err);
                 requestPathMetricsCollector.registerRequest(request.type, rc.path);
                 break;
             }
             case OpCode.setData: {
                 lastOp = "SETD";
+                incrementOpCount(ServerMetrics.getMetrics().OP_COUNT_SET_DATA);
                 rsp = new SetDataResponse(rc.stat);
                 err = Code.get(rc.err);
                 requestPathMetricsCollector.registerRequest(request.type, rc.path);
@@ -327,14 +365,16 @@ public class FinalRequestProcessor implements RequestProcessor {
             }
             case OpCode.reconfig: {
                 lastOp = "RECO";
+                incrementOpCount(ServerMetrics.getMetrics().OP_COUNT_RECONFIG);
                 rsp = new GetDataResponse(
-                    ((QuorumZooKeeperServer) zks).self.getQuorumVerifier().toString().getBytes(),
-                    rc.stat);
+                        ((QuorumZooKeeperServer) zks).self.getQuorumVerifier().toString().getBytes(UTF_8),
+                        rc.stat);
                 err = Code.get(rc.err);
                 break;
             }
             case OpCode.setACL: {
                 lastOp = "SETA";
+                incrementOpCount(ServerMetrics.getMetrics().OP_COUNT_SET_ACL);
                 rsp = new SetACLResponse(rc.stat);
                 err = Code.get(rc.err);
                 requestPathMetricsCollector.registerRequest(request.type, rc.path);
@@ -342,31 +382,42 @@ public class FinalRequestProcessor implements RequestProcessor {
             }
             case OpCode.closeSession: {
                 lastOp = "CLOS";
+                incrementOpCount(ServerMetrics.getMetrics().OP_COUNT_CLOSE_SESSION);
                 err = Code.get(rc.err);
                 break;
             }
             case OpCode.sync: {
                 lastOp = "SYNC";
-                SyncRequest syncRequest = new SyncRequest();
-                ByteBufferInputStream.byteBuffer2Record(request.request, syncRequest);
+                incrementOpCount(ServerMetrics.getMetrics().OP_COUNT_SYNC);
+                SyncRequest syncRequest = request.readRequestRecord(SyncRequest::new);
                 rsp = new SyncResponse(syncRequest.getPath());
                 requestPathMetricsCollector.registerRequest(request.type, syncRequest.getPath());
                 break;
             }
             case OpCode.check: {
                 lastOp = "CHEC";
+                incrementOpCount(ServerMetrics.getMetrics().OP_COUNT_CHECK);
                 rsp = new SetDataResponse(rc.stat);
                 err = Code.get(rc.err);
                 break;
             }
             case OpCode.exists: {
                 lastOp = "EXIS";
-                // TODO we need to figure out the security requirement for this!
-                ExistsRequest existsRequest = new ExistsRequest();
-                ByteBufferInputStream.byteBuffer2Record(request.request, existsRequest);
+                incrementOpCount(ServerMetrics.getMetrics().OP_COUNT_EXISTS);
+                ExistsRequest existsRequest = request.readRequestRecord(ExistsRequest::new);
                 path = existsRequest.getPath();
                 if (path.indexOf('\0') != -1) {
                     throw new KeeperException.BadArgumentsException();
+                }
+                DataNode n = zks.getZKDatabase().getNode(path);
+                if (n != null) {
+                    zks.checkACL(
+                        request.cnxn,
+                        zks.getZKDatabase().aclForNode(n),
+                        ZooDefs.Perms.READ,
+                        request.authInfo,
+                        path,
+                        null);
                 }
                 Stat stat = zks.getZKDatabase().statNode(path, existsRequest.getWatch() ? cnxn : null);
                 rsp = new ExistsResponse(stat);
@@ -375,8 +426,8 @@ public class FinalRequestProcessor implements RequestProcessor {
             }
             case OpCode.getData: {
                 lastOp = "GETD";
-                GetDataRequest getDataRequest = new GetDataRequest();
-                ByteBufferInputStream.byteBuffer2Record(request.request, getDataRequest);
+                incrementOpCount(ServerMetrics.getMetrics().OP_COUNT_GET_DATA);
+                GetDataRequest getDataRequest = request.readRequestRecord(GetDataRequest::new);
                 path = getDataRequest.getPath();
                 rsp = handleGetDataRequest(getDataRequest, cnxn, request.authInfo);
                 requestPathMetricsCollector.registerRequest(request.type, path);
@@ -384,10 +435,8 @@ public class FinalRequestProcessor implements RequestProcessor {
             }
             case OpCode.setWatches: {
                 lastOp = "SETW";
-                SetWatches setWatches = new SetWatches();
-                // TODO we really should not need this
-                request.request.rewind();
-                ByteBufferInputStream.byteBuffer2Record(request.request, setWatches);
+                incrementOpCount(ServerMetrics.getMetrics().OP_COUNT_SET_WATCHES);
+                SetWatches setWatches = request.readRequestRecord(SetWatches::new);
                 long relativeZxid = setWatches.getRelativeZxid();
                 zks.getZKDatabase()
                    .setWatches(
@@ -402,10 +451,8 @@ public class FinalRequestProcessor implements RequestProcessor {
             }
             case OpCode.setWatches2: {
                 lastOp = "STW2";
-                SetWatches2 setWatches = new SetWatches2();
-                // TODO we really should not need this
-                request.request.rewind();
-                ByteBufferInputStream.byteBuffer2Record(request.request, setWatches);
+                incrementOpCount(ServerMetrics.getMetrics().OP_COUNT_SET_WATCHES);
+                SetWatches2 setWatches = request.readRequestRecord(SetWatches2::new);
                 long relativeZxid = setWatches.getRelativeZxid();
                 zks.getZKDatabase().setWatches(relativeZxid,
                         setWatches.getDataWatches(),
@@ -418,17 +465,16 @@ public class FinalRequestProcessor implements RequestProcessor {
             }
             case OpCode.addWatch: {
                 lastOp = "ADDW";
-                AddWatchRequest addWatcherRequest = new AddWatchRequest();
-                ByteBufferInputStream.byteBuffer2Record(request.request,
-                        addWatcherRequest);
+                incrementOpCount(ServerMetrics.getMetrics().OP_COUNT_ADD_WATCH);
+                AddWatchRequest addWatcherRequest = request.readRequestRecord(AddWatchRequest::new);
                 zks.getZKDatabase().addWatch(addWatcherRequest.getPath(), cnxn, addWatcherRequest.getMode());
                 rsp = new ErrorResponse(0);
                 break;
             }
             case OpCode.getACL: {
                 lastOp = "GETA";
-                GetACLRequest getACLRequest = new GetACLRequest();
-                ByteBufferInputStream.byteBuffer2Record(request.request, getACLRequest);
+                incrementOpCount(ServerMetrics.getMetrics().OP_COUNT_GET_ACL);
+                GetACLRequest getACLRequest = request.readRequestRecord(GetACLRequest::new);
                 path = getACLRequest.getPath();
                 DataNode n = zks.getZKDatabase().getNode(path);
                 if (n == null) {
@@ -454,7 +500,7 @@ public class FinalRequestProcessor implements RequestProcessor {
                         null);
                     rsp = new GetACLResponse(acl, stat);
                 } catch (KeeperException.NoAuthException e) {
-                    List<ACL> acl1 = new ArrayList<ACL>(acl.size());
+                    List<ACL> acl1 = new ArrayList<>(acl.size());
                     for (ACL a : acl) {
                         if ("digest".equals(a.getId().getScheme())) {
                             Id id = a.getId();
@@ -470,8 +516,8 @@ public class FinalRequestProcessor implements RequestProcessor {
             }
             case OpCode.getChildren: {
                 lastOp = "GETC";
-                GetChildrenRequest getChildrenRequest = new GetChildrenRequest();
-                ByteBufferInputStream.byteBuffer2Record(request.request, getChildrenRequest);
+                incrementOpCount(ServerMetrics.getMetrics().OP_COUNT_GET_CHILDREN);
+                GetChildrenRequest getChildrenRequest = request.readRequestRecord(GetChildrenRequest::new);
                 path = getChildrenRequest.getPath();
                 rsp = handleGetChildrenRequest(getChildrenRequest, cnxn, request.authInfo);
                 requestPathMetricsCollector.registerRequest(request.type, path);
@@ -479,8 +525,8 @@ public class FinalRequestProcessor implements RequestProcessor {
             }
             case OpCode.getAllChildrenNumber: {
                 lastOp = "GETACN";
-                GetAllChildrenNumberRequest getAllChildrenNumberRequest = new GetAllChildrenNumberRequest();
-                ByteBufferInputStream.byteBuffer2Record(request.request, getAllChildrenNumberRequest);
+                incrementOpCount(ServerMetrics.getMetrics().OP_COUNT_GET_ALL_CHILDREN_NUMBER);
+                GetAllChildrenNumberRequest getAllChildrenNumberRequest = request.readRequestRecord(GetAllChildrenNumberRequest::new);
                 path = getAllChildrenNumberRequest.getPath();
                 DataNode n = zks.getZKDatabase().getNode(path);
                 if (n == null) {
@@ -499,8 +545,8 @@ public class FinalRequestProcessor implements RequestProcessor {
             }
             case OpCode.getChildren2: {
                 lastOp = "GETC";
-                GetChildren2Request getChildren2Request = new GetChildren2Request();
-                ByteBufferInputStream.byteBuffer2Record(request.request, getChildren2Request);
+                incrementOpCount(ServerMetrics.getMetrics().OP_COUNT_GET_CHILDREN);
+                GetChildren2Request getChildren2Request = request.readRequestRecord(GetChildren2Request::new);
                 Stat stat = new Stat();
                 path = getChildren2Request.getPath();
                 DataNode n = zks.getZKDatabase().getNode(path);
@@ -521,8 +567,8 @@ public class FinalRequestProcessor implements RequestProcessor {
             }
             case OpCode.checkWatches: {
                 lastOp = "CHKW";
-                CheckWatchesRequest checkWatches = new CheckWatchesRequest();
-                ByteBufferInputStream.byteBuffer2Record(request.request, checkWatches);
+                incrementOpCount(ServerMetrics.getMetrics().OP_COUNT_CHECK_WATCHES);
+                CheckWatchesRequest checkWatches = request.readRequestRecord(CheckWatchesRequest::new);
                 WatcherType type = WatcherType.fromInt(checkWatches.getType());
                 path = checkWatches.getPath();
                 boolean containsWatcher = zks.getZKDatabase().containsWatcher(path, type, cnxn);
@@ -535,8 +581,8 @@ public class FinalRequestProcessor implements RequestProcessor {
             }
             case OpCode.removeWatches: {
                 lastOp = "REMW";
-                RemoveWatchesRequest removeWatches = new RemoveWatchesRequest();
-                ByteBufferInputStream.byteBuffer2Record(request.request, removeWatches);
+                incrementOpCount(ServerMetrics.getMetrics().OP_COUNT_REMOVE_WATCHES);
+                RemoveWatchesRequest removeWatches = request.readRequestRecord(RemoveWatchesRequest::new);
                 WatcherType type = WatcherType.fromInt(removeWatches.getType());
                 path = removeWatches.getPath();
                 boolean removed = zks.getZKDatabase().removeWatch(path, type, cnxn);
@@ -547,14 +593,20 @@ public class FinalRequestProcessor implements RequestProcessor {
                 requestPathMetricsCollector.registerRequest(request.type, removeWatches.getPath());
                 break;
             }
+            case OpCode.whoAmI: {
+                lastOp = "HOMI";
+                incrementOpCount(ServerMetrics.getMetrics().OP_COUNT_WHO_AM_I);
+                rsp = new WhoAmIResponse(AuthUtil.getClientInfos(request.authInfo));
+                break;
+             }
             case OpCode.getEphemerals: {
                 lastOp = "GETE";
-                GetEphemeralsRequest getEphemerals = new GetEphemeralsRequest();
-                ByteBufferInputStream.byteBuffer2Record(request.request, getEphemerals);
+                incrementOpCount(ServerMetrics.getMetrics().OP_COUNT_GET_EPHEMERALS);
+                GetEphemeralsRequest getEphemerals = request.readRequestRecord(GetEphemeralsRequest::new);
                 String prefixPath = getEphemerals.getPrefixPath();
                 Set<String> allEphems = zks.getZKDatabase().getDataTree().getEphemerals(request.sessionId);
                 List<String> ephemerals = new ArrayList<>();
-                if (StringUtils.isBlank(prefixPath) || "/".equals(prefixPath.trim())) {
+                if (prefixPath == null || prefixPath.trim().isEmpty() || "/".equals(prefixPath.trim())) {
                     ephemerals.addAll(allEphems);
                 } else {
                     for (String p : allEphems) {
@@ -584,13 +636,8 @@ public class FinalRequestProcessor implements RequestProcessor {
             // log at error level as we are returning a marshalling
             // error to the user
             LOG.error("Failed to process {}", request, e);
-            StringBuilder sb = new StringBuilder();
-            ByteBuffer bb = request.request;
-            bb.rewind();
-            while (bb.hasRemaining()) {
-                sb.append(Integer.toHexString(bb.get() & 0xff));
-            }
-            LOG.error("Dumping request buffer: 0x{}", sb.toString());
+            String digest = request.requestDigest();
+            LOG.error("Dumping request buffer for request type {}: 0x{}", Request.op2String(request.type), digest);
             err = Code.MARSHALLINGERROR;
         }
 
@@ -633,6 +680,22 @@ public class FinalRequestProcessor implements RequestProcessor {
         } finally {
             ServerMetrics.getMetrics().RESPONSE_BYTES.add(responseSize);
         }
+    }
+
+    /**
+     * Estimates the serialized size of a getChildren result so that multiRead can bound
+     * its cumulative response size. Each child name is counted as its length in bytes
+     * (chars are a safe lower bound) plus the 4-byte length prefix jute writes per string.
+     */
+    private static long childrenSizeInBytes(List<String> children) {
+        if (children == null) {
+            return 0;
+        }
+        long bytes = 0;
+        for (String child : children) {
+            bytes += 4L + (child == null ? 0 : child.length());
+        }
+        return bytes;
     }
 
     private Record handleGetChildrenRequest(Record request, ServerCnxn cnxn, List<Id> authInfo) throws KeeperException, IOException {
@@ -686,4 +749,9 @@ public class FinalRequestProcessor implements RequestProcessor {
         request.cnxn.updateStatsForResponse(request.cxid, lastZxid, lastOp, request.createTime, currentTime);
     }
 
+    private void incrementOpCount(final Counter specificCounter) {
+        final ServerMetrics metrics = ServerMetrics.getMetrics();
+        specificCounter.add(1);
+        metrics.OP_COUNT_TOTAL.add(1);
+    }
 }

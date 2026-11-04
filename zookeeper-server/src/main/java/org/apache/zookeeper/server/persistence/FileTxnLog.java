@@ -43,6 +43,8 @@ import org.apache.jute.BinaryOutputArchive;
 import org.apache.jute.InputArchive;
 import org.apache.jute.OutputArchive;
 import org.apache.jute.Record;
+import org.apache.zookeeper.common.IOUtils;
+import org.apache.zookeeper.server.Request;
 import org.apache.zookeeper.server.ServerMetrics;
 import org.apache.zookeeper.server.ServerStats;
 import org.apache.zookeeper.server.TxnLogEntry;
@@ -167,6 +169,12 @@ public class FileTxnLog implements TxnLog, Closeable {
      */
     private long prevLogsRunningTotal;
 
+    long filePosition = 0;
+
+    private long unFlushedSize = 0;
+
+    private long fileSize = 0;
+
     /**
      * constructor for FileTxnLog. Take the directory
      * where the txnlogs are stored
@@ -207,7 +215,7 @@ public class FileTxnLog implements TxnLog, Closeable {
      */
     public synchronized long getCurrentLogSize() {
         if (logFileWrite != null) {
-            return logFileWrite.length();
+            return fileSize;
         }
         return 0;
     }
@@ -218,6 +226,13 @@ public class FileTxnLog implements TxnLog, Closeable {
 
     public synchronized long getTotalLogSize() {
         return prevLogsRunningTotal + getCurrentLogSize();
+    }
+
+    /**
+     * Get log size limit
+     */
+    public static long getTxnLogSizeLimit() {
+        return txnLogSizeLimit;
     }
 
     /**
@@ -238,7 +253,9 @@ public class FileTxnLog implements TxnLog, Closeable {
             prevLogsRunningTotal += getCurrentLogSize();
             this.logStream = null;
             oa = null;
-
+            fileSize = 0;
+            filePosition = 0;
+            unFlushedSize = 0;
             // Roll over the current log file into the running total
         }
     }
@@ -248,26 +265,15 @@ public class FileTxnLog implements TxnLog, Closeable {
      * @throws IOException
      */
     public synchronized void close() throws IOException {
-        if (logStream != null) {
-            logStream.close();
-        }
-        for (FileOutputStream log : streamsToFlush) {
-            log.close();
-        }
-    }
-
-    /**
-     * append an entry to the transaction log
-     * @param hdr the header of the transaction
-     * @param txn the transaction part of the entry
-     * returns true iff something appended, otw false
-     */
-    public synchronized boolean append(TxnHeader hdr, Record txn) throws IOException {
-              return append(hdr, txn, null);
+        List<Closeable> toClose = new ArrayList<>(streamsToFlush.size() + 1);
+        toClose.add(logStream);
+        toClose.addAll(streamsToFlush);
+        IOUtils.closeAll(toClose);
     }
 
     @Override
-    public synchronized boolean append(TxnHeader hdr, Record txn, TxnDigest digest) throws IOException {
+    public synchronized boolean append(Request request) throws IOException {
+        TxnHeader hdr = request.getHdr();
         if (hdr == null) {
             return false;
         }
@@ -276,7 +282,7 @@ public class FileTxnLog implements TxnLog, Closeable {
                 "Current zxid {} is <= {} for {}",
                 hdr.getZxid(),
                 lastZxidSeen,
-                hdr.getType());
+                Request.op2String(hdr.getType()));
         } else {
             lastZxidSeen = hdr.getZxid();
         }
@@ -288,22 +294,34 @@ public class FileTxnLog implements TxnLog, Closeable {
             logStream = new BufferedOutputStream(fos);
             oa = BinaryOutputArchive.getArchive(logStream);
             FileHeader fhdr = new FileHeader(TXNLOG_MAGIC, VERSION, dbId);
+            long dataSize = oa.getDataSize();
             fhdr.serialize(oa, "fileheader");
             // Make sure that the magic number is written before padding.
             logStream.flush();
-            filePadding.setCurrentSize(fos.getChannel().position());
+            // Before writing data, first obtain the size of the OutputArchive.
+            // After writing the data, obtain the size of the OutputArchive again,
+            // so we can obtain the size of the data written this time.
+            // In this case, the data already flush into the channel, so add the size to filePosition.
+            filePosition += oa.getDataSize() - dataSize;
+            filePadding.setCurrentSize(filePosition);
             streamsToFlush.add(fos);
         }
-        filePadding.padFile(fos.getChannel());
-        byte[] buf = Util.marshallTxnEntry(hdr, txn, digest);
+        fileSize = filePadding.padFile(fos.getChannel(), filePosition);
+        byte[] buf = request.getSerializeData();
         if (buf == null || buf.length == 0) {
             throw new IOException("Faulty serialization for header " + "and txn");
         }
+        long dataSize = oa.getDataSize();
         Checksum crc = makeChecksumAlgorithm();
         crc.update(buf, 0, buf.length);
         oa.writeLong(crc.getValue(), "txnEntryCRC");
         Util.writeTxnBytes(oa, buf);
-
+        // Before writing data, first obtain the size of the OutputArchive.
+        // After writing the data, obtain the size of the OutputArchive again,
+        // so we can obtain the size of the data written this time.
+        // In this case, the data just write to the cache, not flushed, so add the size to unFlushedSize.
+        // After flushed, the unFlushedSize will add to the filePosition.
+        unFlushedSize += oa.getDataSize() - dataSize;
         return true;
     }
 
@@ -313,7 +331,7 @@ public class FileTxnLog implements TxnLog, Closeable {
      * ascending order.
      * @param logDirList array of files
      * @param snapshotZxid return files at, or before this zxid
-     * @return
+     * @return log files that starts at, or just before, the snapshot and subsequent ones
      */
     public static File[] getLogFiles(File[] logDirList, long snapshotZxid) {
         List<File> files = Util.sortDataDir(logDirList, LOG_FILE_PREFIX, true);
@@ -331,7 +349,7 @@ public class FileTxnLog implements TxnLog, Closeable {
                 logZxid = fzxid;
             }
         }
-        List<File> v = new ArrayList<File>(5);
+        List<File> v = new ArrayList<>(5);
         for (File f : files) {
             long fzxid = Util.getZxidFromName(f.getName(), LOG_FILE_PREFIX);
             if (fzxid < logZxid) {
@@ -354,10 +372,7 @@ public class FileTxnLog implements TxnLog, Closeable {
         // if a log file is more recent we must scan it to find
         // the highest zxid
         long zxid = maxLog;
-        TxnIterator itr = null;
-        try {
-            FileTxnLog txn = new FileTxnLog(logDir);
-            itr = txn.read(maxLog);
+        try (FileTxnLog txn = new FileTxnLog(logDir); TxnIterator itr = txn.read(maxLog)) {
             while (true) {
                 if (!itr.next()) {
                     break;
@@ -367,20 +382,8 @@ public class FileTxnLog implements TxnLog, Closeable {
             }
         } catch (IOException e) {
             LOG.warn("Unexpected exception", e);
-        } finally {
-            close(itr);
         }
         return zxid;
-    }
-
-    private void close(TxnIterator itr) {
-        if (itr != null) {
-            try {
-                itr.close();
-            } catch (IOException ioe) {
-                LOG.warn("Error closing file iterator", ioe);
-            }
-        }
     }
 
     /**
@@ -390,6 +393,13 @@ public class FileTxnLog implements TxnLog, Closeable {
     public synchronized void commit() throws IOException {
         if (logStream != null) {
             logStream.flush();
+            filePosition += unFlushedSize;
+            // If we have written more than we have previously preallocated,
+            // we should override the fileSize by filePosition.
+            if (filePosition > fileSize) {
+                fileSize = filePosition;
+            }
+            unFlushedSize = 0;
         }
         for (FileOutputStream log : streamsToFlush) {
             log.flush();
@@ -468,9 +478,7 @@ public class FileTxnLog implements TxnLog, Closeable {
      * @return true if successful false if not
      */
     public boolean truncate(long zxid) throws IOException {
-        FileTxnIterator itr = null;
-        try {
-            itr = new FileTxnIterator(this.logDir, zxid);
+        try (FileTxnIterator itr = new FileTxnIterator(this.logDir, zxid)) {
             PositionInputStream input = itr.inputStream;
             if (input == null) {
                 throw new IOException("No log files found to truncate! This could "
@@ -487,8 +495,6 @@ public class FileTxnLog implements TxnLog, Closeable {
                     LOG.warn("Unable to truncate {}", itr.logFile);
                 }
             }
-        } finally {
-            close(itr);
         }
         return true;
     }
@@ -701,14 +707,29 @@ public class FileTxnLog implements TxnLog, Closeable {
 
         /**
          * go to the next logfile
+         *
          * @return true if there is one and false if there is no
          * new file to be read
-         * @throws IOException
          */
         private boolean goToNextLog() throws IOException {
-            if (storedFiles.size() > 0) {
+            if (!storedFiles.isEmpty()) {
                 this.logFile = storedFiles.remove(storedFiles.size() - 1);
-                ia = createInputArchive(this.logFile);
+                try {
+                    ia = createInputArchive(this.logFile);
+                } catch (EOFException ex) {
+                    // If this file is the last log file in the database and is empty,
+                    // it means that the last time the file was created
+                    // before the header was written.
+                    if (storedFiles.isEmpty() && this.logFile.length() == 0) {
+                        boolean deleted = this.logFile.delete();
+                        if (!deleted) {
+                            throw new IOException("Failed to delete empty tail log file: " + this.logFile.getName());
+                        }
+                        LOG.warn("Delete empty tail log file to recover from corruption file: {}", this.logFile.getName());
+                        return false;
+                    }
+                    throw ex;
+                }
                 return true;
             }
             return false;

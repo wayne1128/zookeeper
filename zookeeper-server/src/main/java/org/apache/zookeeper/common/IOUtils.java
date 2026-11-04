@@ -23,6 +23,8 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.io.PrintStream;
+import java.util.Arrays;
+import java.util.Collection;
 import org.slf4j.Logger;
 
 /*
@@ -41,6 +43,46 @@ public class IOUtils {
      */
     public static void closeStream(Closeable stream) {
         cleanup(null, stream);
+    }
+
+    /**
+     * Closes every non-null object, preserving any {@link IOException} thrown.
+     *
+     * @param closeables
+     *            the objects to close, in order
+     * @throws IOException the first exception thrown while closing, with later
+     *            exceptions added as suppressed exceptions
+     */
+    public static void closeAll(Closeable... closeables) throws IOException {
+        closeAll(Arrays.asList(closeables));
+    }
+
+    /**
+     * Closes every non-null object, preserving any {@link IOException} thrown.
+     *
+     * @param closeables
+     *            the objects to close, in iteration order
+     * @throws IOException the first exception thrown while closing, with later
+     *            exceptions added as suppressed exceptions
+     */
+    public static void closeAll(Collection<? extends Closeable> closeables) throws IOException {
+        IOException firstException = null;
+        for (Closeable closeable : closeables) {
+            if (closeable != null) {
+                try {
+                    closeable.close();
+                } catch (IOException e) {
+                    if (firstException == null) {
+                        firstException = e;
+                    } else if (firstException != e) {
+                        firstException.addSuppressed(e);
+                    }
+                }
+            }
+        }
+        if (firstException != null) {
+            throw firstException;
+        }
     }
 
     /**
@@ -70,7 +112,7 @@ public class IOUtils {
      * Copies from one stream to another.
      *
      * @param in
-     *            InputStrem to read from
+     *            InputStream to read from
      * @param out
      *            OutputStream to write to
      * @param buffSize
@@ -100,7 +142,7 @@ public class IOUtils {
      * Copies from one stream to another.
      *
      * @param in
-     *            InputStrem to read from
+     *            InputStream to read from
      * @param out
      *            OutputStream to write to
      * @param buffSize

@@ -29,6 +29,7 @@ import org.apache.jute.Record;
 import org.apache.zookeeper.KeeperException;
 import org.apache.zookeeper.KeeperException.Code;
 import org.apache.zookeeper.ZooDefs.OpCode;
+import org.apache.zookeeper.common.IOUtils;
 import org.apache.zookeeper.common.Time;
 import org.apache.zookeeper.server.DataTree;
 import org.apache.zookeeper.server.DataTree.ProcessTxnResult;
@@ -51,10 +52,10 @@ import org.slf4j.LoggerFactory;
  */
 public class FileTxnSnapLog {
 
-    //the directory containing the
+    //the directory containing
     //the transaction logs
     final File dataDir;
-    //the directory containing the
+    //the directory containing
     //the snapshot directory
     final File snapDir;
     TxnLog txnLog;
@@ -204,11 +205,11 @@ public class FileTxnSnapLog {
     }
 
     /**
-     * get the datadir used by this filetxn
+     * get the data log dir used by this filetxn
      * snap log
-     * @return the data dir
+     * @return the data log dir
      */
-    public File getDataDir() {
+    public File getDataLogDir() {
         return this.dataDir;
     }
 
@@ -227,6 +228,15 @@ public class FileTxnSnapLog {
      */
     public SnapshotInfo getLastSnapshotInfo() {
         return this.snapLog.getLastSnapshotInfo();
+    }
+
+    /**
+     * whether to force the write of an initial snapshot after a leader election,
+     * to address ZOOKEEPER-3781 after upgrading from Zookeeper 3.4.x.
+     * @return true if an initial snapshot should be written even if not otherwise required, false otherwise.
+     */
+    public boolean shouldForceWriteInitialSnapshotAfterLeaderElection() {
+        return trustEmptySnapshot && getLastSnapshotInfo() == null;
     }
 
     /**
@@ -304,7 +314,7 @@ public class FileTxnSnapLog {
     }
 
     /**
-     * This function will fast forward the server database to have the latest
+     * This function will fast-forward the server database to have the latest
      * transactions in it.  This is the same as restore, but only reads from
      * the transaction logs and not restores from a snapshot.
      * @param dt the datatree to write transactions to.
@@ -459,9 +469,10 @@ public class FileTxnSnapLog {
      * @param sessionsWithTimeouts the session timeouts to be
      * serialized onto disk
      * @param syncSnap sync the snapshot immediately after write
+     * @return the snapshot file
      * @throws IOException
      */
-    public void save(
+    public File save(
         DataTree dataTree,
         ConcurrentHashMap<Long, Integer> sessionsWithTimeouts,
         boolean syncSnap) throws IOException {
@@ -470,6 +481,7 @@ public class FileTxnSnapLog {
         LOG.info("Snapshotting: 0x{} to {}", Long.toHexString(lastZxid), snapshotFile);
         try {
             snapLog.serialize(dataTree, sessionsWithTimeouts, snapshotFile, syncSnap);
+            return snapshotFile;
         } catch (IOException e) {
             if (snapshotFile.length() == 0) {
                 /* This may be caused by a full disk. In such a case, the server
@@ -552,9 +564,8 @@ public class FileTxnSnapLog {
      * @param n the number of recent valid snapshots
      * @return the list of n recent valid snapshots, with
      * the most recent in front
-     * @throws IOException
      */
-    public List<File> findNValidSnapshots(int n) throws IOException {
+    public List<File> findNValidSnapshots(int n) {
         FileSnap snaplog = new FileSnap(snapDir);
         return snaplog.findNValidSnapshots(n);
     }
@@ -566,7 +577,7 @@ public class FileTxnSnapLog {
      * file may contain transactions beyond given zxid.
      * @param zxid the zxid that contains logs greater than
      * zxid
-     * @return
+     * @return the snapshot logs which may contain transactions newer than the given zxid
      */
     public File[] getSnapshotLogs(long zxid) {
         return FileTxnLog.getLogFiles(dataDir.listFiles(), zxid);
@@ -579,7 +590,7 @@ public class FileTxnSnapLog {
      * @throws IOException
      */
     public boolean append(Request si) throws IOException {
-        return txnLog.append(si.getHdr(), si.getTxn(), si.getTxnDigest());
+        return txnLog.append(si);
     }
 
     /**
@@ -611,14 +622,11 @@ public class FileTxnSnapLog {
      * @throws IOException
      */
     public void close() throws IOException {
-        if (txnLog != null) {
-            txnLog.close();
-            txnLog = null;
-        }
-        if (snapLog != null) {
-            snapLog.close();
-            snapLog = null;
-        }
+        TxnLog txnLogToClose = txnLog;
+        SnapShot snapLogToClose = snapLog;
+        txnLog = null;
+        snapLog = null;
+        IOUtils.closeAll(txnLogToClose, snapLogToClose);
     }
 
     @SuppressWarnings("serial")

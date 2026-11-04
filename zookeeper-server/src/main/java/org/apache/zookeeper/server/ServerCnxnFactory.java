@@ -22,10 +22,14 @@ import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.function.Supplier;
 import javax.management.JMException;
+import javax.security.auth.callback.CallbackHandler;
 import javax.security.auth.login.AppConfigurationEntry;
 import javax.security.auth.login.Configuration;
 import javax.security.auth.login.LoginException;
@@ -41,6 +45,7 @@ public abstract class ServerCnxnFactory {
 
     public static final String ZOOKEEPER_SERVER_CNXN_FACTORY = "zookeeper.serverCnxnFactory";
     private static final String ZOOKEEPER_MAX_CONNECTION = "zookeeper.maxCnxns";
+    private static final String DIGEST_MD5_USER_PREFIX = "user_";
     public static final int ZOOKEEPER_MAX_CONNECTION_DEFAULT = 0;
 
     private static final Logger LOG = LoggerFactory.getLogger(ServerCnxnFactory.class);
@@ -57,7 +62,7 @@ public abstract class ServerCnxnFactory {
     protected int maxCnxns;
 
     // sessionMap is used by closeSession()
-    final ConcurrentHashMap<Long, ServerCnxn> sessionMap = new ConcurrentHashMap<Long, ServerCnxn>();
+    final ConcurrentHashMap<Long, ServerCnxn> sessionMap = new ConcurrentHashMap<>();
 
     private static String loginUser = Login.SYSTEM_USER;
 
@@ -113,7 +118,6 @@ public abstract class ServerCnxnFactory {
 
     public abstract void reconfigure(InetSocketAddress addr);
 
-    protected SaslServerCallbackHandler saslServerCallbackHandler;
     public Login login;
 
     /** Maximum number of connections allowed from particular host (ip) */
@@ -130,7 +134,7 @@ public abstract class ServerCnxnFactory {
         startup(zkServer, true);
     }
 
-    // This method is to maintain compatiblity of startup(zks) and enable sharing of zks
+    // This method is to maintain compatibility of startup(zks) and enable sharing of zks
     // when we add secureCnxnFactory.
     public abstract void startup(ZooKeeperServer zkServer, boolean startServer) throws IOException, InterruptedException;
 
@@ -157,6 +161,64 @@ public abstract class ServerCnxnFactory {
 
     public abstract void closeAll(ServerCnxn.DisconnectReason reason);
 
+    /**
+     * Returns the number of connections that are currently performing a TLS handshake.
+     * Non-Netty implementations return 0.
+     */
+    public int getOutstandingHandshakeNum() {
+        return 0;
+    }
+
+    /**
+     * Attempts to shed approximately the specified percentage of connections.
+     *
+     * @param percentage [0-100] percentage of connections to shed
+     * @return actual number of connections successfully closed (may vary due to randomness)
+     * @throws IllegalArgumentException if percentage not in [0, 100]
+     */
+    public int shedConnections(final int percentage) {
+        if (percentage < 0 || percentage > 100) {
+            throw new IllegalArgumentException("percentage must be between 0 and 100, got: " + percentage);
+        }
+
+        final int totalConnections = cnxns.size();
+        if (percentage == 0 || totalConnections == 0) {
+            return 0;
+        }
+
+        int actualShedCount = 0;
+        // For 100%, close all connections deterministically
+        if (percentage == 100) {
+            for (final ServerCnxn cnxn : cnxns) {
+                try {
+                    cnxn.close(ServerCnxn.DisconnectReason.SHED_CONNECTIONS_COMMAND);
+                    actualShedCount++;
+                } catch (final Exception e) {
+                    LOG.warn("Failed to close connection for session 0x{}: {}",
+                            Long.toHexString(cnxn.getSessionId()), e.getMessage());
+                }
+            }
+        } else {
+            // For other percentages, use probabilistic approach
+            final ThreadLocalRandom random = ThreadLocalRandom.current();
+            final double probability = percentage / 100.0;
+
+            for (final ServerCnxn cnxn : cnxns) {
+                if (random.nextDouble() < probability) {
+                    try {
+                        cnxn.close(ServerCnxn.DisconnectReason.SHED_CONNECTIONS_COMMAND);
+                        actualShedCount++;
+                    } catch (final Exception e) {
+                        LOG.warn("Failed to close connection for session 0x{}: {}",
+                                Long.toHexString(cnxn.getSessionId()), e.getMessage());
+                    }
+                }
+            }
+        }
+        LOG.info("Shed {} out of {} connections ({}%)", actualShedCount, totalConnections, percentage);
+        return actualShedCount;
+    }
+
     public static ServerCnxnFactory createFactory() throws IOException {
         String serverCnxnFactoryName = System.getProperty(ZOOKEEPER_SERVER_CNXN_FACTORY);
         if (serverCnxnFactoryName == null) {
@@ -171,6 +233,43 @@ public abstract class ServerCnxnFactory {
         } catch (Exception e) {
             IOException ioe = new IOException("Couldn't instantiate " + serverCnxnFactoryName, e);
             throw ioe;
+        }
+    }
+
+    /**
+     * Creates a ServerCnxnFactory, defaulting to NettyServerCnxnFactory when
+     * {@code secure} is {@code true} and no explicit factory is configured via
+     * the {@value #ZOOKEEPER_SERVER_CNXN_FACTORY} system property. SSL/TLS
+     * requires Netty; if Netty is not present on the classpath a helpful
+     * {@link IOException} is thrown.
+     *
+     * @param secure {@code true} when the factory will be used for secure (SSL/TLS) connections
+     * @return a new ServerCnxnFactory instance
+     * @throws IOException if the factory cannot be instantiated
+     */
+    public static ServerCnxnFactory createFactory(boolean secure) throws IOException {
+        String serverCnxnFactoryName = System.getProperty(ZOOKEEPER_SERVER_CNXN_FACTORY);
+        if (serverCnxnFactoryName == null) {
+            if (secure) {
+                // Derived from a same-package class rather than a string literal so the shade plugin relocates it.
+                serverCnxnFactoryName = NIOServerCnxnFactory.class.getPackageName() + ".NettyServerCnxnFactory";
+            } else {
+                serverCnxnFactoryName = NIOServerCnxnFactory.class.getName();
+            }
+        }
+        try {
+            ServerCnxnFactory serverCnxnFactory = (ServerCnxnFactory) Class.forName(serverCnxnFactoryName)
+                                                                           .getDeclaredConstructor()
+                                                                           .newInstance();
+            LOG.info("Using {} as server connection factory", serverCnxnFactoryName);
+            return serverCnxnFactory;
+        } catch (Exception | NoClassDefFoundError e) {
+            String msg = "Couldn't instantiate " + serverCnxnFactoryName;
+            if (secure) {
+                msg += ". SSL/TLS support requires Netty; please add netty-handler"
+                    + " (and optionally netty-tcnative-boringssl-static) to your project's dependencies.";
+            }
+            throw new IOException(msg, e);
         }
     }
 
@@ -198,11 +297,11 @@ public abstract class ServerCnxnFactory {
 
     public abstract Iterable<Map<String, Object>> getAllConnectionInfo(boolean brief);
 
-    private final ConcurrentHashMap<ServerCnxn, ConnectionBean> connectionBeans = new ConcurrentHashMap<ServerCnxn, ConnectionBean>();
+    private final ConcurrentHashMap<ServerCnxn, ConnectionBean> connectionBeans = new ConcurrentHashMap<>();
 
     // Connection set is relied on heavily by four letter commands
     // Construct a ConcurrentHashSet using a ConcurrentHashMap
-    protected final Set<ServerCnxn> cnxns = Collections.newSetFromMap(new ConcurrentHashMap<ServerCnxn, Boolean>());
+    protected final Set<ServerCnxn> cnxns = Collections.newSetFromMap(new ConcurrentHashMap<>());
     public void unregisterConnection(ServerCnxn serverCnxn) {
         ConnectionBean jmxConnectionBean = connectionBeans.remove(serverCnxn);
         if (jmxConnectionBean != null) {
@@ -261,7 +360,7 @@ public abstract class ServerCnxnFactory {
                 if (loginContextName != null) {
                     errorMessage += " But " + ZooKeeperSaslServer.LOGIN_CONTEXT_NAME_KEY + " was set.";
                 }
-                LOG.error(errorMessage);
+                LOG.error(errorMessage, securityException);
                 throw new IOException(errorMessage);
             }
             return;
@@ -269,8 +368,11 @@ public abstract class ServerCnxnFactory {
 
         // jaas.conf entry available
         try {
-            saslServerCallbackHandler = new SaslServerCallbackHandler(Configuration.getConfiguration());
-            login = new Login(serverSection, saslServerCallbackHandler, new ZKConfig());
+            Map<String, String> credentials = getDigestMd5Credentials(entries);
+            Supplier<CallbackHandler> callbackHandlerSupplier = () -> {
+                return new SaslServerCallbackHandler(credentials);
+            };
+            login = new Login(serverSection, callbackHandlerSupplier, new ZKConfig());
             setLoginUser(login.getUserName());
             login.startThreadIfNeeded();
         } catch (LoginException e) {
@@ -278,6 +380,28 @@ public abstract class ServerCnxnFactory {
                                   + " ZooKeeper server to authenticate itself properly: "
                                   + e);
         }
+    }
+
+    /**
+     * make server credentials map from configuration's server section.
+     * @param appConfigurationEntries AppConfigurationEntry List
+     * @return Server credentials map
+     */
+    private static Map<String, String> getDigestMd5Credentials(final  AppConfigurationEntry[] appConfigurationEntries) {
+        Map<String, String> credentials = new HashMap<>();
+        for (AppConfigurationEntry entry : appConfigurationEntries) {
+            Map<String, ?> options = entry.getOptions();
+            // Populate DIGEST-MD5 user -> password map with JAAS configuration entries from the "Server" section.
+            // Usernames are distinguished from other options by prefixing the username with a "user_" prefix.
+            for (Map.Entry<String, ?> pair : options.entrySet()) {
+                String key = pair.getKey();
+                if (key.startsWith(DIGEST_MD5_USER_PREFIX)) {
+                    String userName = key.substring(DIGEST_MD5_USER_PREFIX.length());
+                    credentials.put(userName, (String) pair.getValue());
+                }
+            }
+        }
+        return credentials;
     }
 
     private static void setLoginUser(String name) {
@@ -303,7 +427,7 @@ public abstract class ServerCnxnFactory {
         maxCnxns = Integer.getInteger(ZOOKEEPER_MAX_CONNECTION, ZOOKEEPER_MAX_CONNECTION_DEFAULT);
         if (maxCnxns < 0) {
             maxCnxns = ZOOKEEPER_MAX_CONNECTION_DEFAULT;
-            LOG.warn("maxCnxns should be greater than or equal to 0, using default vlaue {}.",
+            LOG.warn("maxCnxns should be greater than or equal to 0, using default value {}.",
                     ZOOKEEPER_MAX_CONNECTION_DEFAULT);
         } else if (maxCnxns == ZOOKEEPER_MAX_CONNECTION_DEFAULT) {
             LOG.warn("maxCnxns is not configured, using default value {}.",

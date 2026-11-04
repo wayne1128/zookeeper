@@ -18,9 +18,13 @@
 
 package org.apache.zookeeper.server.util;
 
-import static org.junit.Assert.assertEquals;
-import org.apache.zookeeper.server.quorum.QuorumPeerConfig.ConfigException;
-import org.junit.Test;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import org.apache.zookeeper.common.ConfigException;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 public class ConfigUtilsTest {
 
@@ -48,14 +52,18 @@ public class ConfigUtilsTest {
         assertEquals(nsa[2], "3888");
     }
 
-    @Test(expected = ConfigException.class)
-    public void testGetHostAndPortWithoutBracket() throws ConfigException {
-        String[] nsa = ConfigUtils.getHostAndPort("[2001:db8:85a3:8d3:1319:8a2e:370:7348");
+    @Test
+    public void testGetHostAndPortWithoutBracket() {
+        assertThrows(ConfigException.class, () -> {
+            String[] nsa = ConfigUtils.getHostAndPort("[2001:db8:85a3:8d3:1319:8a2e:370:7348");
+        });
     }
 
-    @Test(expected = ConfigException.class)
-    public void testGetHostAndPortWithoutPortAfterColon() throws ConfigException {
-        String[] nsa = ConfigUtils.getHostAndPort("[2001:db8:1::242:ac11:2]:");
+    @Test
+    public void testGetHostAndPortWithoutPortAfterColon() {
+        assertThrows(ConfigException.class, () -> {
+            String[] nsa = ConfigUtils.getHostAndPort("[2001:db8:1::242:ac11:2]:");
+        });
     }
 
     @Test
@@ -69,4 +77,75 @@ public class ConfigUtilsTest {
         assertEquals(nsa.length, 1);
     }
 
+    @Test
+    public void testGetPropertyBackwardCompatibleWay() throws ConfigException {
+        String newProp = "zookeeper.prop.x.y.z";
+        String oldProp = "prop.x.y.z";
+
+        // Null as both properties are not set
+        String result = ConfigUtils.getPropertyBackwardCompatibleWay(newProp);
+        assertNull(result);
+
+        // Return old property value when only old property is set
+        String oldPropValue = "oldPropertyValue";
+        System.setProperty(oldProp, oldPropValue);
+        result = ConfigUtils.getPropertyBackwardCompatibleWay(newProp);
+        assertEquals(oldPropValue, result);
+
+        // Return new property value when both properties are set
+        String newPropValue = "newPropertyValue";
+        System.setProperty(newProp, newPropValue);
+        result = ConfigUtils.getPropertyBackwardCompatibleWay(newProp);
+        assertEquals(newPropValue, result);
+
+        // cleanUp
+        clearProp(newProp, oldProp);
+
+        // Return trimmed value
+        System.setProperty(oldProp, oldPropValue + "  ");
+        result = ConfigUtils.getPropertyBackwardCompatibleWay(newProp);
+        assertEquals(oldPropValue, result);
+
+        System.setProperty(newProp, "  " + newPropValue);
+        result = ConfigUtils.getPropertyBackwardCompatibleWay(newProp);
+        assertEquals(newPropValue, result);
+
+        // cleanUp
+        clearProp(newProp, oldProp);
+    }
+
+    /**
+     * Tests the ConfigUtils.getClientConfigStr(String) method with version.
+     */
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "version=1.2.3\n",
+            "version = 1.2.3\n",
+            "version=1.2.3\nfoo=bar\n",
+            "foo=bar\nversion=1.2.3\n"
+    })
+    public void testGetClientConfigStrWithVersion(String configData) {
+        String result = ConfigUtils.getClientConfigStr(configData);
+        assertEquals("1.2.3 ", result);
+    }
+
+    /**
+     * Tests the ConfigUtils.getClientConfigStr(String) method without version.
+     */
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "versions=1.2.3\n",
+            "versions = 1.2.3\n",
+            "foo=bar\n",
+            "version=\n"
+    })
+    public void testGetClientConfigStrWithoutVersion(String configData) {
+        String result = ConfigUtils.getClientConfigStr(configData);
+        assertEquals(" ", result);
+    }
+
+    private void clearProp(String newProp, String oldProp) {
+        System.clearProperty(newProp);
+        System.clearProperty(oldProp);
+    }
 }

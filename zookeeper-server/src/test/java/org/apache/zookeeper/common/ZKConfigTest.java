@@ -18,30 +18,43 @@
 
 package org.apache.zookeeper.common;
 
-
-import static org.junit.Assert.assertEquals;
-import java.util.concurrent.TimeUnit;
-import org.junit.After;
-import org.junit.Rule;
-import org.junit.Test;
-import org.junit.rules.Timeout;
-
-
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import ch.qos.logback.classic.Level;
+import java.io.File;
+import java.io.IOException;
+import org.apache.zookeeper.test.LoggerTestTool;
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 
 public class ZKConfigTest {
 
-    X509Util x509Util = new ClientX509Util();
+    private final X509Util x509Util = new ClientX509Util();
+    private static LoggerTestTool loggerTestTool;
 
-    @Rule
-    public Timeout timeout = new Timeout(10, TimeUnit.SECONDS);
+    @BeforeAll
+    public static void setUpBeforeClass() {
+        loggerTestTool = new LoggerTestTool(ZKConfig.class, Level.DEBUG);
+    }
 
-    @After
+    @AfterAll
+    public static void tearDownAfterClass() throws Exception {
+        loggerTestTool.close();
+    }
+
+    @AfterEach
     public void tearDown() throws Exception {
         System.clearProperty(x509Util.getSslProtocolProperty());
     }
 
     // property is not set we should get the default value
     @Test
+    @Timeout(value = 10)
     public void testBooleanRetrievalFromPropertyDefault() {
         ZKConfig conf = new ZKConfig();
         String prop = "UnSetProperty" + System.currentTimeMillis();
@@ -52,6 +65,7 @@ public class ZKConfigTest {
 
     // property is set to an valid boolean, we should get the set value
     @Test
+    @Timeout(value = 10)
     public void testBooleanRetrievalFromProperty() {
         boolean value = true;
         boolean defaultValue = false;
@@ -63,6 +77,7 @@ public class ZKConfigTest {
 
     // property is set but with white spaces in the beginning
     @Test
+    @Timeout(value = 10)
     public void testBooleanRetrievalFromPropertyWithWhitespacesInBeginning() {
         boolean value = true;
         boolean defaultValue = false;
@@ -74,6 +89,7 @@ public class ZKConfigTest {
 
     // property is set but with white spaces at the end
     @Test
+    @Timeout(value = 10)
     public void testBooleanRetrievalFromPropertyWithWhitespacesAtEnd() {
         boolean value = true;
         boolean defaultValue = false;
@@ -85,6 +101,7 @@ public class ZKConfigTest {
 
     // property is set but with white spaces at the beginning and the end
     @Test
+    @Timeout(value = 10)
     public void testBooleanRetrievalFromPropertyWithWhitespacesAtBeginningAndEnd() {
         boolean value = true;
         boolean defaultValue = false;
@@ -93,4 +110,52 @@ public class ZKConfigTest {
         boolean result = conf.getBoolean(x509Util.getSslProtocolProperty(), defaultValue);
         assertEquals(value, result);
     }
+
+    @Test
+    public void testLogRedactorFromConfigFile() throws ConfigException, IOException {
+        // Arrange
+        File configFile = new File("./src/test/resources/zookeeper-client.config");
+
+        // Act
+        new ZKConfig(configFile.toPath());
+
+        // Assert
+        String logLine = loggerTestTool.readLogLine("ZK Config");
+        assertNotNull(logLine, "Unable to find ZK Config line in the logs");
+        assertFalse(logLine.contains("FileSecret456!"), "Logs should not contain any secrets");
+        assertFalse(logLine.contains("AnotherFileSecret789!"), "Logs should not contain any secrets");
+        assertTrue(logLine.contains("/home/zookeeper/top_secret.txt"));      // what we shouldn't redact
+    }
+
+    @Test
+    public void testLogRedactorInDebugLogs() throws IOException {
+        // Arrange
+        ZKConfig conf = new ZKConfig();
+
+        // Act
+        conf.setProperty("zookeeper.some.secret.password", "0ldP4ssw0rd");
+        conf.setProperty("zookeeper.some.secret.password", "N3Ws3cr3t");
+
+        // Assert
+        String logLine = loggerTestTool.readLogLine("replaced with new value");
+        assertNotNull(logLine, "Unable to find relevant line in the logs");
+        assertFalse(logLine.contains("0ldP4ssw0rd"), "Logs should not contain any secrets");
+        assertFalse(logLine.contains("N3Ws3cr3t"), "Logs should not contain any secrets");
+    }
+
+    @Test
+    public void testDontRedactorInDebugLogs() throws IOException {
+        // Arrange
+        ZKConfig conf = new ZKConfig();
+
+        // Act
+        conf.setProperty("zookeeper.some.secret.passwordPath", "/home/zookeeper/old_secret.txt");  // what we shouldn't redact
+        conf.setProperty("zookeeper.some.secret.passwordPath", "/home/zookeeper/new_secret.txt");  // what we shouldn't redact
+
+        // Assert
+        String logLine = loggerTestTool.readLogLine("replaced with new value");
+        assertNotNull(logLine, "Unable to find relevant line in the logs");
+        assertTrue(logLine.contains("/home/zookeeper/new_secret.txt"));
+    }
+
 }

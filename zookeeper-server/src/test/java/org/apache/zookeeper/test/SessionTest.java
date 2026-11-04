@@ -19,12 +19,13 @@
 package org.apache.zookeeper.test;
 
 import static org.apache.zookeeper.test.ClientBase.CONNECTION_TIMEOUT;
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertFalse;
-import static org.junit.Assert.assertTrue;
-import static org.junit.Assert.fail;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.fail;
 import java.io.File;
 import java.io.IOException;
+import java.util.Arrays;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
@@ -43,9 +44,9 @@ import org.apache.zookeeper.ZooKeeper;
 import org.apache.zookeeper.data.Stat;
 import org.apache.zookeeper.server.ServerCnxnFactory;
 import org.apache.zookeeper.server.ZooKeeperServer;
-import org.junit.After;
-import org.junit.Before;
-import org.junit.Test;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -64,7 +65,7 @@ public class SessionTest extends ZKTestCase {
 
     private final int TICK_TIME = 3000;
 
-    @Before
+    @BeforeEach
     public void setUp() throws Exception {
         if (tmpDir == null) {
             tmpDir = ClientBase.createTmpDir();
@@ -77,23 +78,31 @@ public class SessionTest extends ZKTestCase {
         serverFactory = ServerCnxnFactory.createFactory(PORT, -1);
         serverFactory.startup(zs);
 
-        assertTrue("waiting for server up", ClientBase.waitForServerUp(HOSTPORT, CONNECTION_TIMEOUT));
+        assertTrue(ClientBase.waitForServerUp(HOSTPORT, CONNECTION_TIMEOUT), "waiting for server up");
     }
 
-    @After
+    @AfterEach
     public void tearDown() throws Exception {
         serverFactory.shutdown();
         zs.shutdown();
-        assertTrue("waiting for server down", ClientBase.waitForServerDown(HOSTPORT, CONNECTION_TIMEOUT));
+        assertTrue(ClientBase.waitForServerDown(HOSTPORT, CONNECTION_TIMEOUT), "waiting for server down");
     }
 
     private static class CountdownWatcher implements Watcher {
 
         volatile CountDownLatch clientConnected = new CountDownLatch(1);
+        final CountDownLatch sessionTerminated = new CountDownLatch(1);
 
         public void process(WatchedEvent event) {
-            if (event.getState() == KeeperState.SyncConnected) {
-                clientConnected.countDown();
+            switch (event.getState()) {
+                case SyncConnected:
+                    clientConnected.countDown();
+                    break;
+                case AuthFailed:
+                case Expired:
+                case Closed:
+                    sessionTerminated.countDown();
+                    break;
             }
         }
 
@@ -121,8 +130,8 @@ public class SessionTest extends ZKTestCase {
     // TODO this test is failing due to client close race condition fixing in separate patch for ZOOKEEPER-63
     //    /**
     //     * this test checks to see if the sessionid that was created for the
-    //     * first zookeeper client can be reused for the second one immidiately
-    //     * after the first client closes and the new client resues them.
+    //     * first zookeeper client can be reused for the second one immediately
+    //     * after the first client closes and the new client reuses them.
     //     * @throws IOException
     //     * @throws InterruptedException
     //     * @throws KeeperException
@@ -243,21 +252,8 @@ public class SessionTest extends ZKTestCase {
                                                                                           % hostPorts.length], CONNECTION_TIMEOUT, new MyWatcher(Integer.toString(
                     i
                             + 1)), zk.getSessionId(), zk.getSessionPasswd());
-            final int[] result = new int[1];
-            result[0] = Integer.MAX_VALUE;
-            zknew.sync("/", (rc, path, ctx) -> {
-                synchronized (result) {
-                    result[0] = rc;
-                    result.notify();
-                }
-            }, null);
-            synchronized (result) {
-                if (result[0] == Integer.MAX_VALUE) {
-                    result.wait(5000);
-                }
-            }
-            LOG.info("{} Sync returned {}", hostPorts[(i + 1) % hostPorts.length], result[0]);
-            assertTrue(result[0] == KeeperException.Code.OK.intValue());
+            zknew.sync("/");
+            LOG.info("{} Sync succeed", hostPorts[(i + 1) % hostPorts.length]);
             zknew.setData("/", new byte[1], -1);
             try {
                 zk.setData("/", new byte[1], -1);
@@ -270,6 +266,7 @@ public class SessionTest extends ZKTestCase {
         }
         zk.close();
     }
+
     /**
      * This test makes sure that duplicate state changes are not communicated
      * to the client watcher. For example we should not notify state as
@@ -286,17 +283,15 @@ public class SessionTest extends ZKTestCase {
         // shutdown the server
         serverFactory.shutdown();
 
-        try {
-            Thread.sleep(10000);
-        } catch (InterruptedException e) {
-            // ignore
-        }
+        watcher.sessionTerminated.await();
 
-        // verify that the size is just 2 - ie connect then disconnect
-        // if the client attempts reconnect and we are not handling current
-        // state correctly (ie eventing on duplicate disconnects) then we'll
-        // see a disconnect for each failed connection attempt
-        assertEquals(2, watcher.states.size());
+        // verify that there is no duplicated disconnected event.
+        List<KeeperState> states = Arrays.asList(
+                KeeperState.SyncConnected,
+                KeeperState.Disconnected,
+                KeeperState.Expired
+        );
+        assertEquals(states, watcher.states);
 
         zk.close();
     }
@@ -331,11 +326,11 @@ public class SessionTest extends ZKTestCase {
 
     private class DupWatcher extends CountdownWatcher {
 
-        public List<WatchedEvent> states = new LinkedList<WatchedEvent>();
+        public List<KeeperState> states = new LinkedList<>();
         public void process(WatchedEvent event) {
             super.process(event);
             if (event.getType() == EventType.None) {
-                states.add(event);
+                states.add(event.getState());
             }
         }
 

@@ -30,12 +30,16 @@
 // sets internal zhandle_t members to certain values to simulate the client 
 // connected state. This function should only be used with the single-threaded
 // Async API tests!
-void forceConnected(zhandle_t* zh); 
+void forceConnected(zhandle_t* zh, const struct timeval *last_recv_send = NULL);
 
 /**
  * Gracefully terminates zookeeper I/O and completion threads. 
  */
 void terminateZookeeperThreads(zhandle_t* zh);
+// Record an extra reference held on zh by a test mock.
+void pinZookeeperHandle(zhandle_t* zh);
+// Remove tracking record and return true if zh held an extra mock reference.
+bool unpinZookeeperHandle(zhandle_t* zh);
 
 // *****************************************************************************
 // Abstract watcher action
@@ -149,7 +153,14 @@ struct CloseFinally{
         zhandle_t* lzh=*zh_;
         *zh_=0;
         disarm();
-        return zookeeper_close(lzh);
+        if(lzh==0)return ZOK;
+        // Balance artificial reference held by mock so that handle
+        // resources are completely freed within mock scope.
+        bool pinned=unpinZookeeperHandle(lzh);
+        int rc=zookeeper_close(lzh);
+        if(pinned)
+            api_epilog(lzh,0);
+        return rc;
     }
     void disarm(){zh_=0;}
     zhandle_t ** zh_;
@@ -305,7 +316,7 @@ class HandshakeResponse: public Response
 public:
     HandshakeResponse(int64_t sessId=1):
         protocolVersion(1),timeOut(10000),sessionId(sessId),
-        passwd_len(sizeof(passwd)),readOnly(0)
+        passwd_len(sizeof(passwd)),readOnly(0),omitReadOnly(false)
     {
         memcpy(passwd,"1234567890123456",sizeof(passwd));
     }
@@ -315,6 +326,7 @@ public:
     int32_t passwd_len;
     char passwd[16];
     char readOnly;
+    bool omitReadOnly;
     virtual std::string toString() const ;
 };
 
@@ -442,7 +454,7 @@ public:
     void returnSessionExpired(){ sessionExpired=true; }
     
     // this is a one shot trigger that gets reset back to false
-    // next recv call will return 0 length, thus simulating a connecton loss
+    // next recv call will return 0 length, thus simulating a connection loss
     volatile bool connectionLost;
     void setConnectionLost() {connectionLost=true;}
     

@@ -44,11 +44,11 @@ public class ObserverZooKeeperServer extends LearnerZooKeeperServer {
      * take periodic snapshot. Default is ON.
      */
 
-    private boolean syncRequestProcessorEnabled = this.self.getSyncEnabled();
+    private final boolean syncRequestProcessorEnabled = this.self.getSyncEnabled();
 
     /*
      * Pending sync requests
-     */ ConcurrentLinkedQueue<Request> pendingSyncs = new ConcurrentLinkedQueue<Request>();
+     */ ConcurrentLinkedQueue<Request> pendingSyncs = new ConcurrentLinkedQueue<>();
 
     ObserverZooKeeperServer(FileTxnSnapLog logFactory, QuorumPeer self, ZKDatabase zkDb) throws IOException {
         super(logFactory, self.tickTime, self.minSessionTimeout, self.maxSessionTimeout, self.clientPortListenBacklog, zkDb, self);
@@ -82,7 +82,7 @@ public class ObserverZooKeeperServer extends LearnerZooKeeperServer {
 
     /**
      * Set up the request processors for an Observer:
-     * firstProcesor-&gt;commitProcessor-&gt;finalProcessor
+     * firstProcessor-&gt;commitProcessor-&gt;finalProcessor
      */
     @Override
     protected void setupRequestProcessors() {
@@ -125,18 +125,6 @@ public class ObserverZooKeeperServer extends LearnerZooKeeperServer {
     @Override
     public String getState() {
         return "observer";
-    }
-
-    @Override
-    public synchronized void shutdown() {
-        if (!canShutdown()) {
-            LOG.debug("ZooKeeper server is not running, so not proceeding to shutdown!");
-            return;
-        }
-        super.shutdown();
-        if (syncRequestProcessorEnabled && syncProcessor != null) {
-            syncProcessor.shutdown();
-        }
     }
 
     @Override

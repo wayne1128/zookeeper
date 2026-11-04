@@ -48,9 +48,19 @@ public class Quotas {
      * return the quota path associated with this
      * prefix
      * @param path the actual path in zookeeper.
-     * @return the limit quota path
+     * @return the quota path
      */
     public static String quotaPath(String path) {
+        return quotaZookeeper + path;
+    }
+
+    /**
+     * return the limit quota path associated with this
+     * prefix
+     * @param path the actual path in zookeeper.
+     * @return the limit quota path
+     */
+    public static String limitPath(String path) {
         return quotaZookeeper + path + "/" + limitNode;
     }
 
@@ -64,4 +74,22 @@ public class Quotas {
         return quotaZookeeper + path + "/" + statNode;
     }
 
+    /**
+     * return the real path associated with this
+     * quotaPath.
+     * @param quotaPath the quotaPath which's started with /zookeeper/quota
+     * @return the real path associated with this quotaPath, or an empty string
+     *         if the given path is not actually under /zookeeper/quota. Returning
+     *         "" rather than throwing keeps a stray {@code zookeeper_limits} node
+     *         elsewhere under /zookeeper (or the /zookeeper/quota root itself)
+     *         from raising StringIndexOutOfBoundsException on the
+     *         transaction-apply path, which would kill the SyncRequestProcessor
+     *         critical thread and leave the dataDir unbootable on replay.
+     */
+    public static String trimQuotaPath(String quotaPath) {
+        if (quotaPath == null || !quotaPath.startsWith(quotaZookeeper)) {
+            return "";
+        }
+        return quotaPath.substring(quotaZookeeper.length());
+    }
 }

@@ -18,22 +18,36 @@
 
 package org.apache.zookeeper;
 
+import static org.hamcrest.MatcherAssert.assertThat;
+import static org.hamcrest.Matchers.lessThanOrEqualTo;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.Mockito.any;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.spy;
 import java.io.IOException;
 import java.net.InetSocketAddress;
+import java.net.SocketException;
+import java.nio.channels.Selector;
+import java.nio.channels.SocketChannel;
+import java.time.Duration;
 import java.util.Queue;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import org.apache.zookeeper.ClientCnxn.Packet;
 import org.apache.zookeeper.Watcher.Event.KeeperState;
 import org.apache.zookeeper.ZooDefs.Ids;
 import org.apache.zookeeper.client.HostProvider;
 import org.apache.zookeeper.client.ZKClientConfig;
+import org.apache.zookeeper.common.BusyServer;
 import org.apache.zookeeper.data.Stat;
 import org.apache.zookeeper.server.quorum.QuorumPeerTestBase;
 import org.apache.zookeeper.test.ClientBase;
-import org.junit.Assert;
-import org.junit.Test;
+import org.junit.jupiter.api.Test;
 
 public class ClientCnxnSocketFragilityTest extends QuorumPeerTestBase {
 
@@ -74,6 +88,40 @@ public class ClientCnxnSocketFragilityTest extends QuorumPeerTestBase {
     }
 
     @Test
+    public void testSocketClosedAfterFailure() throws Exception {
+        Duration sessionTimeout = Duration.ofMillis(1000);
+        final AtomicReference<Selector> nioSelector = new AtomicReference<>();
+        try (
+                // given: busy server
+                BusyServer server = new BusyServer();
+                ZooKeeper zk = new ZooKeeper(server.getHostPort(), (int) sessionTimeout.toMillis(), null) {
+                @Override
+                ClientCnxn createConnection(HostProvider hostProvider, int sessionTimeout, long newSessionTimeout, ZKClientConfig clientConfig, Watcher defaultWatcher, ClientCnxnSocket clientCnxnSocket, long sessionId, byte[] sessionPasswd, boolean canBeReadOnly) throws IOException {
+                    ClientCnxnSocketNIO socket = spy((ClientCnxnSocketNIO) clientCnxnSocket);
+
+                    doAnswer(mock -> {
+                        SocketChannel spy = spy((SocketChannel) mock.callRealMethod());
+                        // when: connect get exception
+                        //
+                        // this could happen if system's network service is unavailable,
+                        // for examples, "ifdown eth0" or "service network stop" and so on.
+                        doThrow(new SocketException("Network is unreachable")).when(spy).connect(any());
+                        return spy;
+                    }).when(socket).createSock();
+
+                    nioSelector.set(socket.getSelector());
+                    return super.createConnection(hostProvider, sessionTimeout, newSessionTimeout, clientConfig, defaultWatcher, socket, sessionId, sessionPasswd, canBeReadOnly);
+                }
+            }) {
+
+            Thread.sleep(sessionTimeout.toMillis() * 5);
+
+            // then: sockets of failed connections are closed, so at most one registered socket
+            assertThat(nioSelector.get().keys().size(), lessThanOrEqualTo(1));
+        }
+    }
+
+    @Test
     public void testClientCnxnSocketFragility() throws Exception {
         System.setProperty(ZKClientConfig.ZOOKEEPER_CLIENT_CNXN_SOCKET,
                 FragileClientCnxnSocketNIO.class.getName());
@@ -98,8 +146,8 @@ public class ClientCnxnSocketFragilityTest extends QuorumPeerTestBase {
 
         // Ensure server started
         for (int i = 0; i < SERVER_COUNT; i++) {
-            Assert.assertTrue("waiting for server " + i + " being up",
-                    ClientBase.waitForServerUp("127.0.0.1:" + clientPorts[i], CONNECTION_TIMEOUT));
+            assertTrue(ClientBase.waitForServerUp("127.0.0.1:" + clientPorts[i], CONNECTION_TIMEOUT),
+                    "waiting for server " + i + " being up");
         }
         String path = "/testClientCnxnSocketFragility";
         String data = "balabala";
@@ -109,8 +157,8 @@ public class ClientCnxnSocketFragilityTest extends QuorumPeerTestBase {
 
         // Let's see some successful operations
         zk.create(path, data.getBytes(), Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
-        Assert.assertEquals(new String(zk.getData(path, false, new Stat())), data);
-        Assert.assertTrue(!watcher.isSessionExpired());
+        assertEquals(new String(zk.getData(path, false, new Stat())), data);
+        assertTrue(!watcher.isSessionExpired());
 
         // Let's make a broken operation
         socket.mute();
@@ -119,11 +167,11 @@ public class ClientCnxnSocketFragilityTest extends QuorumPeerTestBase {
             zk.getData(path, false, new Stat());
         } catch (KeeperException e) {
             catchKeeperException = true;
-            Assert.assertFalse(e instanceof KeeperException.SessionExpiredException);
+            assertFalse(e instanceof KeeperException.SessionExpiredException);
         }
         socket.unmute();
-        Assert.assertTrue(catchKeeperException);
-        Assert.assertTrue(!watcher.isSessionExpired());
+        assertTrue(catchKeeperException);
+        assertTrue(!watcher.isSessionExpired());
 
         GetDataRetryForeverBackgroundTask retryForeverGetData =
                 new GetDataRetryForeverBackgroundTask(zk, path);
@@ -143,8 +191,8 @@ public class ClientCnxnSocketFragilityTest extends QuorumPeerTestBase {
         TimeUnit.MILLISECONDS.sleep(3000);
 
         // Since we already close zookeeper, we expect that the zk should not be alive.
-        Assert.assertTrue(!zk.isAlive());
-        Assert.assertTrue(!watcher.isSessionExpired());
+        assertTrue(!zk.isAlive());
+        assertTrue(!watcher.isSessionExpired());
 
         retryForeverGetData.syncCloseTask();
         for (int i = 0; i < SERVER_COUNT; i++) {
@@ -278,21 +326,25 @@ public class ClientCnxnSocketFragilityTest extends QuorumPeerTestBase {
         private volatile boolean hitUnsafeRegion = false;
 
         public CustomClientCnxn(
-            String chrootPath,
             HostProvider hostProvider,
             int sessionTimeout,
+            long newSessionTimeout,
             ZKClientConfig zkClientConfig,
             Watcher defaultWatcher,
             ClientCnxnSocket clientCnxnSocket,
+            long sessionId,
+            byte[] sessionPasswd,
             boolean canBeReadOnly
         ) throws IOException {
             super(
-                chrootPath,
                 hostProvider,
                 sessionTimeout,
+                newSessionTimeout,
                 zkClientConfig,
                 defaultWatcher,
                 clientCnxnSocket,
+                sessionId,
+                sessionPasswd,
                 canBeReadOnly);
         }
 
@@ -312,7 +364,7 @@ public class ClientCnxnSocketFragilityTest extends QuorumPeerTestBase {
         @Override
         protected void onConnecting(InetSocketAddress addr) {
             if (closing) {
-                LOG.info("Attempt to connnecting {} {} {}", addr, closing, state);
+                LOG.info("Attempt to connecting {} {} {}", addr, closing, state);
                 ///////// Unsafe Region ////////
                 // Slow down and zoom out the unsafe point to make risk
                 // The unsafe point is that startConnect happens after sendThread.close
@@ -324,7 +376,7 @@ public class ClientCnxnSocketFragilityTest extends QuorumPeerTestBase {
 
         @Override
         public void disconnect() {
-            Assert.assertTrue(closing);
+            assertTrue(closing);
             LOG.info("Attempt to disconnecting client for session: 0x{} {} {}", Long.toHexString(getSessionId()), closing, state);
             sendThread.close();
             ///////// Unsafe Region ////////
@@ -336,9 +388,6 @@ public class ClientCnxnSocketFragilityTest extends QuorumPeerTestBase {
                 LOG.warn("Got interrupted while waiting for the sender thread to close", ex);
             }
             eventThread.queueEventOfDeath();
-            if (zooKeeperSaslClient != null) {
-                zooKeeperSaslClient.shutdown();
-            }
         }
     }
 
@@ -352,24 +401,29 @@ public class ClientCnxnSocketFragilityTest extends QuorumPeerTestBase {
             return cnxn.getState().isAlive();
         }
 
+        @Override
         ClientCnxn createConnection(
-            String chrootPath,
             HostProvider hostProvider,
             int sessionTimeout,
+            long newSessionTimeout,
             ZKClientConfig clientConfig,
             Watcher defaultWatcher,
             ClientCnxnSocket clientCnxnSocket,
+            long sessionId,
+            byte[] sessionPasswd,
             boolean canBeReadOnly
         ) throws IOException {
-            Assert.assertTrue(clientCnxnSocket instanceof FragileClientCnxnSocketNIO);
+            assertTrue(clientCnxnSocket instanceof FragileClientCnxnSocketNIO);
             socket = (FragileClientCnxnSocketNIO) clientCnxnSocket;
             ClientCnxnSocketFragilityTest.this.cnxn = new CustomClientCnxn(
-                chrootPath,
                 hostProvider,
                 sessionTimeout,
+                newSessionTimeout,
                 clientConfig,
                 defaultWatcher,
                 clientCnxnSocket,
+                sessionId,
+                sessionPasswd,
                 canBeReadOnly);
             return ClientCnxnSocketFragilityTest.this.cnxn;
         }

@@ -23,6 +23,7 @@ import javax.management.JMException;
 import javax.security.sasl.SaslException;
 import org.apache.yetus.audience.InterfaceAudience;
 import org.apache.zookeeper.audit.ZKAuditProvider;
+import org.apache.zookeeper.common.ConfigException;
 import org.apache.zookeeper.jmx.ManagedUtil;
 import org.apache.zookeeper.metrics.MetricsProvider;
 import org.apache.zookeeper.metrics.MetricsProviderLifeCycleException;
@@ -34,9 +35,9 @@ import org.apache.zookeeper.server.ServerMetrics;
 import org.apache.zookeeper.server.ZKDatabase;
 import org.apache.zookeeper.server.ZooKeeperServerMain;
 import org.apache.zookeeper.server.admin.AdminServer.AdminServerException;
+import org.apache.zookeeper.server.auth.ProviderRegistry;
 import org.apache.zookeeper.server.persistence.FileTxnSnapLog;
 import org.apache.zookeeper.server.persistence.FileTxnSnapLog.DatadirException;
-import org.apache.zookeeper.server.quorum.QuorumPeerConfig.ConfigException;
 import org.apache.zookeeper.server.util.JvmPauseMonitor;
 import org.apache.zookeeper.util.ServiceUtils;
 import org.slf4j.Logger;
@@ -51,8 +52,8 @@ import org.slf4j.LoggerFactory;
  * configuration information. This file is a Properties file, so keys and
  * values are separated by equals (=) and the key/value pairs are separated
  * by new lines. The following is a general summary of keys used in the
- * configuration file. For full details on this see the documentation in
- * docs/index.html
+ * configuration file. For full details see the
+ * <a href="https://zookeeper.apache.org/doc/current/admin-ops/administrators-guide/configuration-parameters">Administrator's Guide</a>.
  * <ol>
  * <li>dataDir - The directory where the ZooKeeper data is stored.</li>
  * <li>dataLogDir - The directory where the ZooKeeper transaction log is stored.</li>
@@ -122,14 +123,16 @@ public class QuorumPeerMain {
         QuorumPeerConfig config = new QuorumPeerConfig();
         if (args.length == 1) {
             config.parse(args[0]);
+            // The purge task can access server data before runFromConfig is called.
+            ZKAuditProvider.checkAuditState();
         }
 
-        // Start and schedule the the purge task
+        // Start and schedule the purge task
         DatadirCleanupManager purgeMgr = new DatadirCleanupManager(
             config.getDataDir(),
             config.getDataLogDir(),
             config.getSnapRetainCount(),
-            config.getPurgeInterval());
+            config.getPurgeIntervalInMs());
         purgeMgr.start();
 
         if (args.length == 1 && config.isDistributed()) {
@@ -142,6 +145,8 @@ public class QuorumPeerMain {
     }
 
     public void runFromConfig(QuorumPeerConfig config) throws IOException, AdminServerException {
+        // Validate auditing before starting metrics, transaction storage, or listeners.
+        ZKAuditProvider.checkAuditState();
         try {
             ManagedUtil.registerLog4jMBeans();
         } catch (JMException e) {
@@ -149,7 +154,7 @@ public class QuorumPeerMain {
         }
 
         LOG.info("Starting quorum peer, myid=" + config.getServerId());
-        MetricsProvider metricsProvider;
+        final MetricsProvider metricsProvider;
         try {
             metricsProvider = MetricsProviderBootstrap.startMetricsProvider(
                 config.getMetricsProviderClassName(),
@@ -159,6 +164,7 @@ public class QuorumPeerMain {
         }
         try {
             ServerMetrics.metricsProviderInitialized(metricsProvider);
+            ProviderRegistry.initialize();
             ServerCnxnFactory cnxnFactory = null;
             ServerCnxnFactory secureCnxnFactory = null;
 
@@ -168,7 +174,7 @@ public class QuorumPeerMain {
             }
 
             if (config.getSecureClientPortAddress() != null) {
-                secureCnxnFactory = ServerCnxnFactory.createFactory();
+                secureCnxnFactory = ServerCnxnFactory.createFactory(true);
                 secureCnxnFactory.configure(config.getSecureClientPortAddress(), config.getMaxClientCnxns(), config.getClientPortListenBacklog(), true);
             }
 
@@ -188,6 +194,7 @@ public class QuorumPeerMain {
             quorumPeer.setObserverMasterPort(config.getObserverMasterPort());
             quorumPeer.setConfigFileName(config.getConfigFilename());
             quorumPeer.setClientPortListenBacklog(config.getClientPortListenBacklog());
+            quorumPeer.setMaxClientCnxns(config.getMaxClientCnxns());
             quorumPeer.setZKDatabase(new ZKDatabase(quorumPeer.getTxnFactory()));
             quorumPeer.setQuorumVerifier(config.getQuorumVerifier(), false);
             if (config.getLastSeenQuorumVerifier() != null) {
@@ -231,12 +238,10 @@ public class QuorumPeerMain {
             // warn, but generally this is ok
             LOG.warn("Quorum Peer interrupted", e);
         } finally {
-            if (metricsProvider != null) {
-                try {
-                    metricsProvider.stop();
-                } catch (Throwable error) {
-                    LOG.warn("Error while stopping metrics", error);
-                }
+            try {
+                metricsProvider.stop();
+            } catch (Throwable error) {
+                LOG.warn("Error while stopping metrics", error);
             }
         }
     }
@@ -244,6 +249,25 @@ public class QuorumPeerMain {
     // @VisibleForTesting
     protected QuorumPeer getQuorumPeer() throws SaslException {
         return new QuorumPeer();
+    }
+
+    /**
+     * Shutdowns properly the service, this method is not a public API.
+     */
+    public void close() {
+        if (quorumPeer != null) {
+            try {
+                quorumPeer.shutdown();
+            } finally {
+                quorumPeer = null;
+            }
+        }
+    }
+
+    @Override
+    public String toString() {
+        QuorumPeer peer = quorumPeer;
+        return peer == null ? "" : peer.toString();
     }
 
 }

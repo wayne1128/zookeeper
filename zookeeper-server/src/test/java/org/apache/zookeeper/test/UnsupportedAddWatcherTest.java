@@ -17,22 +17,27 @@
 
 package org.apache.zookeeper.test;
 
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import java.io.IOException;
 import java.io.PrintWriter;
 import java.util.Collections;
+import java.util.List;
 import org.apache.zookeeper.AddWatchMode;
+import org.apache.zookeeper.CreateMode;
 import org.apache.zookeeper.KeeperException;
 import org.apache.zookeeper.Watcher;
+import org.apache.zookeeper.ZooDefs;
 import org.apache.zookeeper.ZooKeeper;
+import org.apache.zookeeper.data.ACL;
 import org.apache.zookeeper.server.watch.IWatchManager;
 import org.apache.zookeeper.server.watch.WatchManagerFactory;
 import org.apache.zookeeper.server.watch.WatcherOrBitSet;
 import org.apache.zookeeper.server.watch.WatchesPathReport;
 import org.apache.zookeeper.server.watch.WatchesReport;
 import org.apache.zookeeper.server.watch.WatchesSummary;
-import org.junit.After;
-import org.junit.Before;
-import org.junit.Test;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
 
 public class UnsupportedAddWatcherTest extends ClientBase {
 
@@ -58,12 +63,12 @@ public class UnsupportedAddWatcherTest extends ClientBase {
         }
 
         @Override
-        public WatcherOrBitSet triggerWatch(String path, Watcher.Event.EventType type) {
+        public WatcherOrBitSet triggerWatch(String path, Watcher.Event.EventType type, long zxid, List<ACL> acl) {
             return new WatcherOrBitSet(Collections.emptySet());
         }
 
         @Override
-        public WatcherOrBitSet triggerWatch(String path, Watcher.Event.EventType type, WatcherOrBitSet suppress) {
+        public WatcherOrBitSet triggerWatch(String path, Watcher.Event.EventType type, long zxid, List<ACL> acl, WatcherOrBitSet suppress) {
             return new WatcherOrBitSet(Collections.emptySet());
         }
 
@@ -98,13 +103,13 @@ public class UnsupportedAddWatcherTest extends ClientBase {
         }
     }
 
-    @Before
+    @BeforeEach
     public void setUp() throws Exception {
         System.setProperty(WatchManagerFactory.ZOOKEEPER_WATCH_MANAGER_NAME, StubbedWatchManager.class.getName());
         super.setUp();
     }
 
-    @After
+    @AfterEach
     public void tearDown() throws Exception {
         try {
             super.tearDown();
@@ -113,12 +118,16 @@ public class UnsupportedAddWatcherTest extends ClientBase {
         }
     }
 
-    @Test(expected = KeeperException.MarshallingErrorException.class)
+    @Test
     public void testBehavior() throws IOException, InterruptedException, KeeperException {
-        try (ZooKeeper zk = createClient(hostPort)) {
-            // the server will generate an exception as our custom watch manager doesn't implement
-            // the new version of addWatch()
-            zk.addWatch("/foo", event -> {}, AddWatchMode.PERSISTENT_RECURSIVE);
-        }
+        assertThrows(KeeperException.MarshallingErrorException.class, () -> {
+            try (ZooKeeper zk = createClient(hostPort)) {
+                // the server will generate an exception as our custom watch manager doesn't implement
+                // the new version of addWatch()
+                zk.create("/foo", null, ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
+                zk.addWatch("/foo", event -> {
+                }, AddWatchMode.PERSISTENT_RECURSIVE);
+            }
+        });
     }
 }

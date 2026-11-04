@@ -30,8 +30,8 @@
   <groupId>org.apache.zookeeper</groupId>
   <artifactId>parent</artifactId>
   <packaging>pom</packaging>
-  <!-- to change version: mvn -\-batch-mode release:update-versions -DdevelopmentVersion=3.6.0-SNAPSHOT -->
-  <version>3.7.0-SNAPSHOT</version>
+  <!-- to change version: mvn -B release:update-versions -DdevelopmentVersion=3.6.0-SNAPSHOT -->
+  <version>3.10.0-SNAPSHOT</version>
   <name>Apache ZooKeeper</name>
   <description>
     ZooKeeper is a centralized service for maintaining configuration information, naming,
@@ -57,7 +57,7 @@
   </licenses>
 
   <modules>
-    <module>zookeeper-docs</module>
+    <module>zookeeper-website</module>
     <module>zookeeper-jute</module>
     <module>zookeeper-server</module>
     <module>zookeeper-metrics-providers</module>
@@ -79,7 +79,7 @@
   </issueManagement>
   <ciManagement>
     <system>jenkins</system>
-    <url>https://builds.apache.org/view/Z/view/ZooKeeper/</url>
+    <url>https://ci-hadoop.apache.org/view/ZooKeeper/</url>
   </ciManagement>
   <mailingLists>
     <mailingList>
@@ -253,6 +253,36 @@
         <email>eolivelli@apache.org</email>
         <timezone>+1</timezone>
     </developer>
+    <developer>
+      <id>nkalmar</id>
+      <name>Norbert Kalmar</name>
+      <email>nkalmar@apache.org</email>
+      <timezone>+1</timezone>
+    </developer>
+    <developer>
+      <id>enixon</id>
+      <name>Brian Nixon</name>
+      <email>enixon@apache.org</email>
+      <timezone>-8</timezone>
+    </developer>
+    <developer>
+      <id>symat</id>
+      <name>Mate Szalay-Beko</name>
+      <email>symat@apache.org</email>
+      <timezone>+1</timezone>
+    </developer>
+    <developer>
+      <id>ddiederen</id>
+      <name>Damien Diederen</name>
+      <email>ddiederen@apache.org</email>
+      <timezone>Europe/Berlin</timezone>
+    </developer>
+    <developer>
+      <id>maoling</id>
+      <name>Ling Mao</name>
+      <email>maoling@apache.org</email>
+      <timezone>+8</timezone>
+    </developer>
   </developers>
 
   <profiles>
@@ -320,9 +350,6 @@
           <name>m2e.version</name>
         </property>
       </activation>
-      <properties>
-        <maven.compiler.release>8</maven.compiler.release>
-      </properties>
       <build>
         <pluginManagement>
           <plugins>
@@ -407,46 +434,140 @@
       </build>
     </profile>
     <profile>
-      <id>jdk-release-flag</id>
+      <id>clover</id>
       <activation>
-        <jdk>[9,)</jdk>
+        <activeByDefault>false</activeByDefault>
+        <property>
+          <name>clover</name>
+        </property>
       </activation>
       <properties>
-        <maven.compiler.release>8</maven.compiler.release>
+        <cloverDatabase>${project.build.directory}/clover/zookeeper-coverage.db</cloverDatabase>
       </properties>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.openclover</groupId>
+            <artifactId>clover-maven-plugin</artifactId>
+            <configuration>
+              <includesAllSourceRoots>false</includesAllSourceRoots>
+              <includesTestSourceRoots>true</includesTestSourceRoots>
+              <cloverDatabase>${cloverDatabase}</cloverDatabase>
+              <targetPercentage>50%</targetPercentage>
+              <outputDirectory>${project.build.directory}/clover</outputDirectory>
+              <alwaysReport>true</alwaysReport>
+              <generateHistorical>false</generateHistorical>
+              <cloverDatabase>${project.build.directory}/clover/zookeeper-coverage.db</cloverDatabase>
+              <cloverMergeDatabase>${project.build.directory}/clover/zookeeper-coverage.db</cloverMergeDatabase>
+              <outputDirectory>${project.build.directory}/clover</outputDirectory>
+              <generateHtml>true</generateHtml>
+              <generateXml>true</generateXml>
+              <includesAllSourceRoots>false</includesAllSourceRoots>
+              <includesTestSourceRoots>true</includesTestSourceRoots>
+              <includes>
+                <include>org/apache/zookeeper/**/*</include>
+              </includes>
+              <excludes>
+                <exclude>org/apache/zookeeper/version/**/*</exclude>
+                  <exclude>**/ReadOnlyModeTest.java</exclude>
+                  <exclude>**/KeeperStateTest.java</exclude>
+              </excludes>
+            </configuration>
+            <executions>
+              <execution>
+                <id>clover-setup</id>
+                <phase>process-sources</phase>
+                <goals>
+                  <goal>setup</goal>
+                </goals>
+              </execution>
+              <execution>
+                <id>clover</id>
+                <phase>test</phase>
+                <goals>
+                  <goal>clover</goal>
+                </goals>
+              </execution>
+            </executions>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+    <profile>
+      <id>sonar</id>
+      <properties>
+        <sonar.php.coverage.reportPaths>${project.build.directory}/clover/clover.xml</sonar.php.coverage.reportPaths>
+      </properties>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.sonarsource.scanner.maven</groupId>
+            <artifactId>sonar-maven-plugin</artifactId>
+          </plugin>
+        </plugins>
+        <pluginManagement>
+          <plugins>
+            <plugin>
+              <groupId>org.sonarsource.scanner.maven</groupId>
+              <artifactId>sonar-maven-plugin</artifactId>
+              <version>${sonar-maven-plugin.version}</version>
+              <configuration>
+                <sonar.dynamicAnalysis>reuseReports</sonar.dynamicAnalysis>
+                <sonar.core.codeCoveragePlugin>clover</sonar.core.codeCoveragePlugin>
+                <sonar.clover.reportPath>${project.build.directory}/clover/clover.xml</sonar.clover.reportPath>
+                <sonar.surefire.reportsPath>target/surefire-reports</sonar.surefire.reportsPath>
+                <sonar.core.codeCoveragePlugin>clover</sonar.core.codeCoveragePlugin>
+                <sonar.clover.version>${clover-maven-plugin.version}</sonar.clover.version>
+              </configuration>
+            </plugin>
+          </plugins>
+        </pluginManagement>
+      </build>
     </profile>
   </profiles>
 
   <properties>
     <!-- maven properties -->
-    <maven.compiler.source>1.8</maven.compiler.source>
-    <maven.compiler.target>1.8</maven.compiler.target>
+    <maven.compiler.release>17</maven.compiler.release>
+    <project.build.outputTimestamp>1691130453</project.build.outputTimestamp>
     <dependency.locations.enabled>false</dependency.locations.enabled>
+    <surefire.version>2.22.1</surefire.version>
 
     <surefire-forkcount>8</surefire-forkcount>
+    <redirectTestOutputToFile>true</redirectTestOutputToFile>
 
     <!-- dependency versions -->
-    <slf4j.version>1.7.25</slf4j.version>
-    <audience-annotations.version>0.5.0</audience-annotations.version>
+    <slf4j.version>2.0.13</slf4j.version>
+    <logback-version>1.5.37</logback-version>
+    <audience-annotations.version>0.12.0</audience-annotations.version>
     <jmockit.version>1.48</jmockit.version>
     <junit.version>5.6.2</junit.version>
-    <log4j.version>1.2.17</log4j.version>
-    <mockito.version>2.27.0</mockito.version>
-    <hamcrest.version>1.3</hamcrest.version>
-    <commons-cli.version>1.2</commons-cli.version>
-    <netty.version>4.1.48.Final</netty.version>
-    <jetty.version>9.4.24.v20191120</jetty.version>
-    <jackson.version>2.10.3</jackson.version>
-    <json.version>1.1.1</json.version>
-    <jline.version>2.14.6</jline.version>
-    <snappy.version>1.1.7</snappy.version>
+    <junit-platform.version>1.6.2</junit-platform.version>
+    <mockito.version>5.23.0</mockito.version>
+    <hamcrest.version>2.2</hamcrest.version>
+    <commons-cli.version>1.5.0</commons-cli.version>
+    <netty.version>4.1.138.Final</netty.version>
+    <jetty.version>12.1.12</jetty.version>
+    <!-- Servlet API version required by Jetty EE10 (see ee10.jakarta.servlet.api.version in jetty-ee10) -->
+    <jakarta.servlet.version>6.0.0</jakarta.servlet.version>
+    <jackson.version>2.22.3</jackson.version>
+    <jline.version>3.30.14</jline.version>
+    <snappy.version>1.1.10.5</snappy.version>
     <kerby.version>2.0.0</kerby.version>
-    <bouncycastle.version>1.60</bouncycastle.version>
-    <commons-collections.version>3.2.2</commons-collections.version>
-    <commons-lang.version>2.6</commons-lang.version>
-    <dropwizard.version>3.2.5</dropwizard.version>
-    <spotbugsannotations.version>4.0.2</spotbugsannotations.version>
-    <checkstyle.version>8.17</checkstyle.version>
+    <bouncycastle.version>1.78</bouncycastle.version>
+    <commons-collections.version>4.4</commons-collections.version>
+    <dropwizard.version>4.1.12.1</dropwizard.version>
+    <spotbugsannotations.version>4.9.3</spotbugsannotations.version>
+    <checkstyle.version>8.39</checkstyle.version>
+    <enforcer.version>3.0.0-M3</enforcer.version>
+    <commons-io.version>2.17.0</commons-io.version>
+    <burningwave.mockdns.version>0.27.2</burningwave.mockdns.version>
+    <dnsjava.version>3.5.1</dnsjava.version>
+    <archunit.version>1.4.2</archunit.version>
+    <clover-maven-plugin.version>4.4.1</clover-maven-plugin.version>
+    <sonar-maven-plugin.version>3.7.0.1746</sonar-maven-plugin.version>
+    <maven.min.version>3.5.0</maven.min.version>
+    <java.min.version>${maven.compiler.release}</java.min.version>
 
     <!-- parameters to pass to C client build -->
     <c-client-openssl>yes</c-client-openssl>
@@ -458,18 +579,13 @@
     <dependencies>
       <dependency>
         <groupId>org.hamcrest</groupId>
-        <artifactId>hamcrest-all</artifactId>
+        <artifactId>hamcrest-library</artifactId>
         <version>${hamcrest.version}</version>
       </dependency>
       <dependency>
-        <groupId>commons-collections</groupId>
-        <artifactId>commons-collections</artifactId>
+        <groupId>org.apache.commons</groupId>
+        <artifactId>commons-collections4</artifactId>
         <version>${commons-collections.version}</version>
-      </dependency>
-      <dependency>
-        <groupId>commons-lang</groupId>
-        <artifactId>commons-lang</artifactId>
-        <version>${commons-lang.version}</version>
       </dependency>
       <dependency>
         <groupId>org.apache.yetus</groupId>
@@ -520,12 +636,12 @@
       </dependency>
       <dependency>
         <groupId>org.bouncycastle</groupId>
-        <artifactId>bcprov-jdk15on</artifactId>
+        <artifactId>bcprov-jdk18on</artifactId>
         <version>${bouncycastle.version}</version>
       </dependency>
       <dependency>
         <groupId>org.bouncycastle</groupId>
-        <artifactId>bcpkix-jdk15on</artifactId>
+        <artifactId>bcpkix-jdk18on</artifactId>
         <version>${bouncycastle.version}</version>
       </dependency>
       <dependency>
@@ -534,20 +650,14 @@
         <version>${slf4j.version}</version>
       </dependency>
       <dependency>
-        <groupId>org.slf4j</groupId>
-        <artifactId>slf4j-log4j12</artifactId>
-        <version>${slf4j.version}</version>
-        <exclusions>
-          <exclusion>
-            <groupId>*</groupId>
-            <artifactId>*</artifactId>
-          </exclusion>
-        </exclusions>
+        <groupId>ch.qos.logback</groupId>
+        <artifactId>logback-core</artifactId>
+        <version>${logback-version}</version>
       </dependency>
       <dependency>
-        <groupId>log4j</groupId>
-        <artifactId>log4j</artifactId>
-        <version>${log4j.version}</version>
+        <groupId>ch.qos.logback</groupId>
+        <artifactId>logback-classic</artifactId>
+        <version>${logback-version}</version>
       </dependency>
       <dependency>
         <groupId>org.jmockit</groupId>
@@ -556,8 +666,25 @@
       </dependency>
       <dependency>
         <groupId>org.junit.jupiter</groupId>
+        <artifactId>junit-jupiter-api</artifactId>
+        <version>${junit.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.junit.jupiter</groupId>
         <artifactId>junit-jupiter-engine</artifactId>
         <version>${junit.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.junit.jupiter</groupId>
+        <artifactId>junit-jupiter-params</artifactId>
+        <version>${junit.version}</version>
+        <scope>test</scope>
+      </dependency>
+      <dependency>
+        <groupId>org.junit.platform</groupId>
+        <artifactId>junit-platform-runner</artifactId>
+        <version>${junit-platform.version}</version>
+        <scope>test</scope>
       </dependency>
       <dependency>
         <groupId>org.junit.vintage</groupId>
@@ -570,24 +697,37 @@
         <version>${mockito.version}</version>
       </dependency>
       <dependency>
-        <groupId>io.netty</groupId>
-        <artifactId>netty-handler</artifactId>
-        <version>${netty.version}</version>
+        <groupId>com.tngtech.archunit</groupId>
+        <artifactId>archunit-junit5</artifactId>
+        <version>${archunit.version}</version>
+        <scope>test</scope>
       </dependency>
       <dependency>
         <groupId>io.netty</groupId>
-        <artifactId>netty-transport-native-epoll</artifactId>
+        <artifactId>netty-bom</artifactId>
         <version>${netty.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
       </dependency>
       <dependency>
         <groupId>org.eclipse.jetty</groupId>
-        <artifactId>jetty-server</artifactId>
+        <artifactId>jetty-bom</artifactId>
         <version>${jetty.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
       </dependency>
       <dependency>
-        <groupId>org.eclipse.jetty</groupId>
-        <artifactId>jetty-servlet</artifactId>
+        <groupId>org.eclipse.jetty.ee10</groupId>
+        <artifactId>jetty-ee10-bom</artifactId>
         <version>${jetty.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+      <!-- Not managed by the Jetty BOMs, so it has to be pinned explicitly -->
+      <dependency>
+        <groupId>jakarta.servlet</groupId>
+        <artifactId>jakarta.servlet-api</artifactId>
+        <version>${jakarta.servlet.version}</version>
       </dependency>
       <dependency>
         <groupId>io.dropwizard.metrics</groupId>
@@ -606,18 +746,7 @@
         <version>${jackson.version}</version>
       </dependency>
       <dependency>
-        <groupId>com.googlecode.json-simple</groupId>
-        <artifactId>json-simple</artifactId>
-        <version>${json.version}</version>
-        <exclusions>
-          <exclusion>
-              <groupId>junit</groupId>
-              <artifactId>junit</artifactId>
-          </exclusion>
-        </exclusions>
-      </dependency>
-      <dependency>
-        <groupId>jline</groupId>
+        <groupId>org.jline</groupId>
         <artifactId>jline</artifactId>
         <version>${jline.version}</version>
       </dependency>
@@ -633,6 +762,21 @@
         <artifactId>snappy-java</artifactId>
         <version>${snappy.version}</version>
       </dependency>
+      <dependency>
+        <groupId>commons-io</groupId>
+        <artifactId>commons-io</artifactId>
+        <version>${commons-io.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.burningwave</groupId>
+        <artifactId>tools</artifactId>
+        <version>${burningwave.mockdns.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>dnsjava</groupId>
+        <artifactId>dnsjava</artifactId>
+        <version>${dnsjava.version}</version>
+      </dependency>
     </dependencies>
   </dependencyManagement>
 
@@ -642,11 +786,11 @@
         <plugin>
           <groupId>org.apache.maven.plugins</groupId>
           <artifactId>maven-compiler-plugin</artifactId>
-          <version>3.8.1</version>
           <configuration>
              <showWarnings>true</showWarnings>
              <compilerArgs>
                <compilerArg>-Werror</compilerArg>
+               <compilerArg>-Xlint:deprecation</compilerArg>
                <compilerArg>-Xlint:unchecked</compilerArg>
                <compilerArg>-Xlint:-options</compilerArg>
                <compilerArg>-Xdoclint:-missing</compilerArg>
@@ -658,7 +802,6 @@
         <plugin>
           <groupId>org.apache.maven.plugins</groupId>
           <artifactId>maven-jar-plugin</artifactId>
-          <version>3.1.0</version>
           <configuration>
             <archive>
               <manifestEntries>
@@ -670,7 +813,6 @@
         <plugin>
           <groupId>org.apache.maven.plugins</groupId>
           <artifactId>maven-source-plugin</artifactId>
-          <version>3.0.1</version>
         </plugin>
         <plugin>
           <groupId>org.apache.maven.plugins</groupId>
@@ -684,12 +826,11 @@
         <plugin>
           <groupId>org.apache.maven.plugins</groupId>
           <artifactId>maven-assembly-plugin</artifactId>
-          <version>3.1.0</version>
+          <version>3.6.0</version>
         </plugin>
         <plugin>
           <groupId>org.apache.maven.plugins</groupId>
           <artifactId>maven-release-plugin</artifactId>
-          <version>3.0.0-M1</version>
         </plugin>
         <plugin>
           <groupId>org.apache.maven.plugins</groupId>
@@ -699,17 +840,18 @@
         <plugin>
           <groupId>org.apache.maven.plugins</groupId>
           <artifactId>maven-surefire-plugin</artifactId>
-          <version>2.22.1</version>
+          <configuration>
+              <trimStackTrace>false</trimStackTrace>
+              <redirectTestOutputToFile>${redirectTestOutputToFile}</redirectTestOutputToFile>
+          </configuration>
         </plugin>
         <plugin>
           <groupId>org.apache.maven.plugins</groupId>
           <artifactId>maven-antrun-plugin</artifactId>
-          <version>1.8</version>
         </plugin>
         <plugin>
           <groupId>org.apache.maven.plugins</groupId>
           <artifactId>maven-dependency-plugin</artifactId>
-          <version>3.1.1</version>
         </plugin>
         <plugin>
           <groupId>org.codehaus.mojo</groupId>
@@ -737,25 +879,54 @@
         <plugin>
           <groupId>org.openclover</groupId>
           <artifactId>clover-maven-plugin</artifactId>
-          <version>4.3.1</version>
+          <version>${clover-maven-plugin.version}</version>
         </plugin>
         <plugin>
           <groupId>com.github.spotbugs</groupId>
           <artifactId>spotbugs-maven-plugin</artifactId>
-          <version>4.0.0</version>
+          <version>4.9.3.0</version>
           <configuration>
             <excludeFilterFile>excludeFindBugsFilter.xml</excludeFilterFile>
           </configuration>
+          <dependencies>
+            <!-- Override ASM version to support JDK 25 (class file version 69)
+             TODO: Remove this override when future SpotBugs version bundles ASM 9.9+ -->
+            <dependency>
+              <groupId>org.ow2.asm</groupId>
+              <artifactId>asm</artifactId>
+              <version>9.9.1</version>
+            </dependency>
+            <dependency>
+              <groupId>org.ow2.asm</groupId>
+              <artifactId>asm-analysis</artifactId>
+              <version>9.9.1</version>
+            </dependency>
+            <dependency>
+              <groupId>org.ow2.asm</groupId>
+              <artifactId>asm-commons</artifactId>
+              <version>9.9.1</version>
+            </dependency>
+            <dependency>
+              <groupId>org.ow2.asm</groupId>
+              <artifactId>asm-tree</artifactId>
+              <version>9.9.1</version>
+            </dependency>
+            <dependency>
+              <groupId>org.ow2.asm</groupId>
+              <artifactId>asm-util</artifactId>
+              <version>9.9.1</version>
+            </dependency>
+          </dependencies>
         </plugin>
         <plugin>
           <groupId>org.owasp</groupId>
           <artifactId>dependency-check-maven</artifactId>
-          <version>5.3.0</version>
+          <version>12.1.6</version>
         </plugin>
         <plugin>
           <groupId>org.apache.maven.plugins</groupId>
           <artifactId>maven-checkstyle-plugin</artifactId>
-          <version>3.1.0</version>
+          <version>3.1.1</version>
           <dependencies>
             <dependency>
               <groupId>com.puppycrawl.tools</groupId>
@@ -773,15 +944,6 @@
             <includeTestResources>false</includeTestResources>
             <includeTestSourceDirectory>true</includeTestSourceDirectory>
           </configuration>
-          <executions>
-            <execution>
-              <id>checkstyle</id>
-              <phase>validate</phase>
-              <goals>
-                <goal>check</goal>
-              </goals>
-            </execution>
-          </executions>
         </plugin>
         <!-- we don't need this plugin-->
         <plugin>
@@ -793,6 +955,16 @@
             </execution>
           </executions>
         </plugin>
+        <plugin>
+          <groupId>org.apache.felix</groupId>
+          <artifactId>maven-bundle-plugin</artifactId>
+          <version>5.1.9</version>
+        </plugin>
+        <plugin>
+          <groupId>org.cyclonedx</groupId>
+          <artifactId>cyclonedx-maven-plugin</artifactId>
+          <version>2.7.9</version>
+       </plugin>
       </plugins>
     </pluginManagement>
 
@@ -811,33 +983,11 @@
         </executions>
       </plugin>
       <plugin>
-        <groupId>org.openclover</groupId>
-        <artifactId>clover-maven-plugin</artifactId>
-        <configuration>
-          <generateHtml>true</generateHtml>
-          <generateXml>true</generateXml>
-          <includes>
-            <include>org/apache/zookeeper/**/*</include>
-          </includes>
-          <excludes>
-            <exclude>org/apache/zookeeper/version/**/*</exclude>
-          </excludes>
-        </configuration>
-        <executions>
-          <execution>
-            <phase>pre-site</phase>
-            <goals>
-              <goal>instrument</goal>
-              <goal>aggregate</goal>
-            </goals>
-          </execution>
-        </executions>
-      </plugin>
-      <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-antrun-plugin</artifactId>
         <executions>
           <execution>
+            <id>set-hostname-property</id>
             <phase>validate</phase>
             <goals>
               <goal>run</goal>
@@ -945,9 +1095,9 @@
       <plugin>
         <groupId>org.apache.rat</groupId>
         <artifactId>apache-rat-plugin</artifactId>
+        <version>0.15</version>
         <configuration>
           <excludes>
-            <exclude>**/log4j.properties</exclude>
             <exclude>**/README.md</exclude>
             <exclude>**/findbugsExcludeFile.xml</exclude>
             <exclude>**/checkstyle-noframes-sorted.xsl</exclude>
@@ -958,9 +1108,7 @@
             <exclude>.travis.yml</exclude>
             <exclude>excludeFindBugsFilter.xml</exclude>
             <exclude>README_packaging.md</exclude>
-            <exclude>src/main/resources/markdown/skin/*</exclude>
-            <exclude>src/main/resources/markdown/html/*</exclude>
-            <exclude>src/main/resources/markdown/images/*</exclude>
+            <exclude>**/src/test/resources/embedded/*.conf</exclude>
             <!-- contrib -->
             <exclude>**/JMX-RESOURCES</exclude>
             <exclude>**/src/main/resources/mainClasses</exclude>
@@ -1025,6 +1173,108 @@
                  <message>Prepared ${project.version}</message>
               </configuration>
             </execution>
+        </executions>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-enforcer-plugin</artifactId>
+        <version>${enforcer.version}</version>
+        <executions>
+          <execution>
+            <id>display-info</id>
+            <goals>
+              <goal>display-info</goal>
+            </goals>
+            <phase>initialize</phase>
+            <inherited>false</inherited>
+          </execution>
+          <execution>
+            <id>zookeeper-min-maven-min-java</id>
+            <goals>
+              <goal>enforce</goal>
+            </goals>
+            <configuration>
+              <rules>
+                <requireMavenVersion>
+                  <version>[${maven.min.version},)</version>
+                  <message>Maven is out of date.
+                    ZooKeeper requires at least version ${maven.min.version} of Maven to properly build from source.
+                    You appear to be using an older version. You can use either "mvn -version" or
+                    "mvn enforcer:display-info" to verify what version is active.</message>
+                </requireMavenVersion>
+                <requireJavaVersion>
+                  <version>[${java.min.version},)</version>
+                  <message>Java is out of date.
+                    ZooKeeper requires at least version ${java.min.version} of the JDK to properly build from source.
+                    You appear to be using an older version. You can use either "mvn -version" or
+                    "mvn enforcer:display-info" to verify what version is active.</message>
+                </requireJavaVersion>
+              </rules>
+            </configuration>
+          </execution>
+          <execution>
+            <id>banned-commons-lang</id>
+            <goals>
+              <goal>enforce</goal>
+            </goals>
+            <configuration>
+              <rules>
+                <bannedDependencies>
+                  <excludes>
+                    <exclude>commons-lang:commons-lang</exclude>
+                  </excludes>
+                  <searchTransitive>false</searchTransitive>
+                  <message>We don't use commons-lang anymore, so do not depend on it directly.</message>
+                </bannedDependencies>
+              </rules>
+            </configuration>
+          </execution>
+          <execution>
+            <id>banned-commons-lang3</id>
+            <goals>
+              <goal>enforce</goal>
+            </goals>
+            <configuration>
+              <rules>
+                <bannedDependencies>
+                  <excludes>
+                    <exclude>org.apache.commons:commons-lang3</exclude>
+                  </excludes>
+                  <searchTransitive>false</searchTransitive>
+                  <message>We don't use commons-lang3, so do not depend on it directly.</message>
+                </bannedDependencies>
+              </rules>
+            </configuration>
+          </execution>
+          <execution>
+            <id>banned-json-simple</id>
+            <goals>
+              <goal>enforce</goal>
+            </goals>
+            <configuration>
+              <rules>
+                <bannedDependencies>
+                  <excludes>
+                    <exclude>com.googlecode.json-simple:json-simple</exclude>
+                  </excludes>
+                  <searchTransitive>false</searchTransitive>
+                  <message>We don't use json-simple anymore, so do not depend on it directly.</message>
+                </bannedDependencies>
+              </rules>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+      <plugin>
+        <groupId>org.cyclonedx</groupId>
+        <artifactId>cyclonedx-maven-plugin</artifactId>
+        <executions>
+          <execution>
+            <goals>
+              <goal>makeBom</goal>
+            </goals>
+            <phase>package</phase>
+          </execution>
         </executions>
       </plugin>
     </plugins>

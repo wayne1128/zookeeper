@@ -18,16 +18,23 @@
 
 package org.apache.zookeeper;
 
-import static org.junit.Assert.assertTrue;
-import static org.junit.Assert.fail;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.fail;
 import java.io.File;
-import java.time.LocalDateTime;
+import java.time.Instant;
+import java.util.concurrent.CompletableFuture;
+import org.apache.zookeeper.metrics.MetricsUtils;
+import org.apache.zookeeper.metrics.impl.DefaultMetricsProvider;
+import org.apache.zookeeper.server.ServerMetrics;
 import org.apache.zookeeper.util.ServiceUtils;
-import org.junit.BeforeClass;
-import org.junit.Rule;
-import org.junit.rules.TestWatcher;
-import org.junit.runner.Description;
-import org.junit.runner.RunWith;
+import org.hamcrest.CustomMatcher;
+import org.hamcrest.Description;
+import org.hamcrest.Matcher;
+import org.hamcrest.StringDescription;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.TestInfo;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -37,11 +44,11 @@ import org.slf4j.LoggerFactory;
  * Basic utilities shared by all tests. Also logging of various events during
  * the test execution (start/stop/success/failure/etc...)
  */
-@RunWith(JUnit4ZKTestRunner.class)
 public class ZKTestCase {
 
     protected static final File testBaseDir = new File(System.getProperty("build.test.dir", "build"));
     private static final Logger LOG = LoggerFactory.getLogger(ZKTestCase.class);
+    public static final int DEFAULT_METRIC_TIMEOUT = 30;
 
     static {
         // Disable System.exit in tests.
@@ -54,54 +61,60 @@ public class ZKTestCase {
         return testName;
     }
 
-    @BeforeClass
-    public static void before() {
-        if (!testBaseDir.exists()) {
-            assertTrue(
-                "Cannot properly create test base directory " + testBaseDir.getAbsolutePath(),
-                testBaseDir.mkdirs());
-        } else if (!testBaseDir.isDirectory()) {
-            assertTrue(
-                "Cannot properly delete file with duplicate name of test base directory " + testBaseDir.getAbsolutePath(),
-                testBaseDir.delete());
-            assertTrue(
-                "Cannot properly create test base directory " + testBaseDir.getAbsolutePath(),
-                testBaseDir.mkdirs());
+    public void syncClient(ZooKeeper zk, boolean synchronous) throws KeeperException {
+        if (synchronous) {
+            try {
+                zk.sync("/");
+            } catch (InterruptedException ex) {
+                throw new RuntimeException(ex);
+            }
+            return;
+        }
+        final CompletableFuture<KeeperException.Code> synced = new CompletableFuture<>();
+        zk.sync("/", (rc, path, ctx) -> {
+            synced.complete(KeeperException.Code.get(rc));
+        }, null);
+        KeeperException.Code code = synced.join();
+        if (code != KeeperException.Code.OK) {
+            throw KeeperException.create(code);
         }
     }
 
-    @Rule
-    public TestWatcher watchman = new TestWatcher() {
-
-        @Override
-        public void starting(Description method) {
-            // By default, disable starting a JettyAdminServer in tests to avoid
-            // accidentally attempting to start multiple admin servers on the
-            // same port.
-            System.setProperty("zookeeper.admin.enableServer", "false");
-            // ZOOKEEPER-2693 disables all 4lw by default.
-            // Here we enable the 4lw which ZooKeeper tests depends.
-            System.setProperty("zookeeper.4lw.commands.whitelist", "*");
-            testName = method.getMethodName();
-            LOG.info("STARTING {}", testName);
+    @BeforeAll
+    public static void before() {
+        if (!testBaseDir.exists()) {
+            assertTrue(testBaseDir.mkdirs(),
+                "Cannot properly create test base directory " + testBaseDir.getAbsolutePath());
+        } else if (!testBaseDir.isDirectory()) {
+            assertTrue(testBaseDir.delete(),
+                "Cannot properly delete file with duplicate name of test base directory " + testBaseDir.getAbsolutePath());
+            assertTrue(testBaseDir.mkdirs(),
+                "Cannot properly create test base directory " + testBaseDir.getAbsolutePath());
         }
+    }
 
-        @Override
-        public void finished(Description method) {
-            LOG.info("FINISHED {}", testName);
-        }
+    @BeforeEach
+    public void starting(TestInfo testInfo) {
+        ServerMetrics.metricsProviderInitialized(new DefaultMetricsProvider());
 
-        @Override
-        public void succeeded(Description method) {
-            LOG.info("SUCCEEDED {}", testName);
-        }
+        // By default, disable starting a JettyAdminServer in tests to avoid
+        // accidentally attempting to start multiple admin servers on the
+        // same port.
+        System.setProperty("zookeeper.admin.enableServer", "false");
 
-        @Override
-        public void failed(Throwable e, Description method) {
-            LOG.error("FAILED {}", testName, e);
-        }
+        // disable rate limiting
+        System.setProperty("zookeeper.admin.rateLimiterIntervalInMS", "0");
 
-    };
+        // ZOOKEEPER-2693 disables all 4lw by default.
+        // Here we enable the 4lw which ZooKeeper tests depends.
+        System.setProperty("zookeeper.4lw.commands.whitelist", "*");
+        LOG.info("STARTING {}", testInfo.getTestMethod());
+    }
+
+    @AfterEach
+    public void finished(TestInfo testInfo) {
+        LOG.info("FINISHED {}", testInfo.getTestMethod());
+    }
 
     public interface WaitForCondition {
 
@@ -120,9 +133,9 @@ public class ZKTestCase {
      * @param timeout   timeout in seconds
      * @throws InterruptedException
      */
-    public void waitFor(String msg, WaitForCondition condition, int timeout) throws InterruptedException {
-        final LocalDateTime deadline = LocalDateTime.now().plusSeconds(timeout);
-        while (LocalDateTime.now().isBefore(deadline)) {
+    public static void waitFor(String msg, WaitForCondition condition, int timeout) throws InterruptedException {
+        final Instant deadline = Instant.now().plusSeconds(timeout);
+        while (Instant.now().isBefore(deadline)) {
             if (condition.evaluate()) {
                 return;
             }
@@ -131,4 +144,36 @@ public class ZKTestCase {
         fail(msg);
     }
 
+    public static <T> void waitForMetric(String metricKey, Matcher<T> matcher) throws InterruptedException {
+        waitForMetric(metricKey, matcher, DEFAULT_METRIC_TIMEOUT);
+    }
+
+    public static <T> void waitForMetric(String metricKey, Matcher<T> matcher, int timeoutInSeconds) throws InterruptedException {
+        String errorMessage = String.format("metric \"%s\" failed to match after %d seconds",
+            metricKey, timeoutInSeconds);
+        waitFor(errorMessage, () -> {
+            @SuppressWarnings("unchecked")
+            T actual = (T) MetricsUtils.currentServerMetrics().get(metricKey);
+            if (!matcher.matches(actual)) {
+                Description description = new StringDescription();
+                matcher.describeMismatch(actual, description);
+                LOG.info("match failed for metric {}: {}", metricKey, description);
+                return false;
+            }
+            return true;
+        }, timeoutInSeconds);
+    }
+
+    /**
+     * Functionally identical to {@link org.hamcrest.Matchers#closeTo} except that it accepts all numerical types
+     * instead of failing if the value is not a {@link Double}.
+     */
+    public static Matcher<Number> closeTo(double operand, double error) {
+        return new CustomMatcher<Number>(String.format("A number within %s of %s", error, operand)) {
+            @Override
+            public boolean matches(Object actual) {
+                return Math.abs(operand - ((Number) actual).doubleValue()) <= error;
+            }
+        };
+    }
 }

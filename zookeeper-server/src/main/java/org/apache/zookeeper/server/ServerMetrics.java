@@ -19,13 +19,14 @@
 package org.apache.zookeeper.server;
 
 import org.apache.zookeeper.metrics.Counter;
+import org.apache.zookeeper.metrics.CounterSet;
 import org.apache.zookeeper.metrics.MetricsContext;
 import org.apache.zookeeper.metrics.MetricsContext.DetailLevel;
 import org.apache.zookeeper.metrics.MetricsProvider;
 import org.apache.zookeeper.metrics.Summary;
 import org.apache.zookeeper.metrics.SummarySet;
-import org.apache.zookeeper.metrics.impl.DefaultMetricsProvider;
 import org.apache.zookeeper.metrics.impl.NullMetricsProvider;
+import org.apache.zookeeper.server.util.QuotaMetricsUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -39,15 +40,10 @@ public final class ServerMetrics {
     public static final ServerMetrics NULL_METRICS = new ServerMetrics(NullMetricsProvider.INSTANCE);
 
     /**
-     * Dummy instance useful for tests.
-     */
-    public static final ServerMetrics DEFAULT_METRICS_FOR_TESTS = new ServerMetrics(new DefaultMetricsProvider());
-
-    /**
      * Real instance used for tracking server side metrics. The final value is
      * assigned after the {@link MetricsProvider} bootstrap.
      */
-    private static volatile ServerMetrics CURRENT = DEFAULT_METRICS_FOR_TESTS;
+    private static volatile ServerMetrics CURRENT = NULL_METRICS;
 
     /**
      * Access current ServerMetrics.
@@ -70,11 +66,17 @@ public final class ServerMetrics {
         FSYNC_TIME = metricsContext.getSummary("fsynctime", DetailLevel.BASIC);
 
         SNAPSHOT_TIME = metricsContext.getSummary("snapshottime", DetailLevel.BASIC);
+        SNAPSHOT_ERROR_COUNT = metricsContext.getCounter("snapshot_error_count");
+        SNAPSHOT_RATE_LIMITED_COUNT = metricsContext.getCounter("snapshot_rate_limited_count");
+        RESTORE_TIME = metricsContext.getSummary("restore_time", DetailLevel.BASIC);
+        RESTORE_ERROR_COUNT = metricsContext.getCounter("restore_error_count");
+        RESTORE_RATE_LIMITED_COUNT = metricsContext.getCounter("restore_rate_limited_count");
         DB_INIT_TIME = metricsContext.getSummary("dbinittime", DetailLevel.BASIC);
         READ_LATENCY = metricsContext.getSummary("readlatency", DetailLevel.ADVANCED);
         UPDATE_LATENCY = metricsContext.getSummary("updatelatency", DetailLevel.ADVANCED);
         PROPAGATION_LATENCY = metricsContext.getSummary("propagation_latency", DetailLevel.ADVANCED);
         FOLLOWER_SYNC_TIME = metricsContext.getSummary("follower_sync_time", DetailLevel.BASIC);
+        OBSERVER_SYNC_TIME = metricsContext.getSummary("observer_sync_time", DetailLevel.BASIC);
         ELECTION_TIME = metricsContext.getSummary("election_time", DetailLevel.BASIC);
         LOOKING_COUNT = metricsContext.getCounter("looking_count");
         DIFF_COUNT = metricsContext.getCounter("diff_count");
@@ -133,6 +135,9 @@ public final class ServerMetrics {
         // Expiry queue stats
         SESSIONLESS_CONNECTIONS_EXPIRED = metricsContext.getCounter("sessionless_connections_expired");
         STALE_SESSIONS_EXPIRED = metricsContext.getCounter("stale_sessions_expired");
+
+        UNAVAILABLE_TIME = metricsContext.getSummary("unavailable_time", DetailLevel.BASIC);
+        LEADER_UNAVAILABLE_TIME = metricsContext.getSummary("leader_unavailable_time", DetailLevel.BASIC);
 
         /*
          * Number of requests that are in the session queue.
@@ -256,6 +261,37 @@ public final class ServerMetrics {
         WATCH_BYTES = metricsContext.getCounter("watch_bytes");
 
         JVM_PAUSE_TIME = metricsContext.getSummary("jvm_pause_time_ms", DetailLevel.ADVANCED);
+
+        QUOTA_EXCEEDED_ERROR_PER_NAMESPACE = metricsContext.getCounterSet(QuotaMetricsUtils.QUOTA_EXCEEDED_ERROR_PER_NAMESPACE);
+
+        TTL_NODE_DELETED_COUNT = metricsContext.getCounter("ttl_node_deleted_count");
+        TTL_NODE_CREATED_COUNT = metricsContext.getCounter("ttl_node_created_count");
+
+        // Operation count metrics
+        OP_COUNT_TOTAL = metricsContext.getCounter("op_count_total");
+        OP_COUNT_ADD_WATCH = metricsContext.getCounter("op_count_add_watch");
+        OP_COUNT_CHECK = metricsContext.getCounter("op_count_check");
+        OP_COUNT_CHECK_WATCHES = metricsContext.getCounter("op_count_check_watches");
+        OP_COUNT_CLOSE_SESSION = metricsContext.getCounter("op_count_close_session");
+        OP_COUNT_CREATE = metricsContext.getCounter("op_count_create");
+        OP_COUNT_CREATE_SESSION = metricsContext.getCounter("op_count_create_session");
+        OP_COUNT_DELETE = metricsContext.getCounter("op_count_delete");
+        OP_COUNT_EXISTS = metricsContext.getCounter("op_count_exists");
+        OP_COUNT_GET_ACL = metricsContext.getCounter("op_count_get_acl");
+        OP_COUNT_GET_ALL_CHILDREN_NUMBER = metricsContext.getCounter("op_count_get_all_children_number");
+        OP_COUNT_GET_CHILDREN = metricsContext.getCounter("op_count_get_children");
+        OP_COUNT_GET_DATA = metricsContext.getCounter("op_count_get_data");
+        OP_COUNT_GET_EPHEMERALS = metricsContext.getCounter("op_count_get_ephemerals");
+        OP_COUNT_MULTI = metricsContext.getCounter("op_count_multi");
+        OP_COUNT_MULTI_READ = metricsContext.getCounter("op_count_multi_read");
+        OP_COUNT_PING = metricsContext.getCounter("op_count_ping");
+        OP_COUNT_RECONFIG = metricsContext.getCounter("op_count_reconfig");
+        OP_COUNT_REMOVE_WATCHES = metricsContext.getCounter("op_count_remove_watches");
+        OP_COUNT_SET_ACL = metricsContext.getCounter("op_count_set_acl");
+        OP_COUNT_SET_DATA = metricsContext.getCounter("op_count_set_data");
+        OP_COUNT_SET_WATCHES = metricsContext.getCounter("op_count_set_watches");
+        OP_COUNT_SYNC = metricsContext.getCounter("op_count_sync");
+        OP_COUNT_WHO_AM_I = metricsContext.getCounter("op_count_who_am_i");
     }
 
     /**
@@ -267,6 +303,31 @@ public final class ServerMetrics {
      * Snapshot writing time
      */
     public final Summary SNAPSHOT_TIME;
+
+    /**
+     * Snapshot error count
+     */
+    public final Counter SNAPSHOT_ERROR_COUNT;
+
+    /**
+     * Snapshot rate limited count
+     */
+    public final Counter SNAPSHOT_RATE_LIMITED_COUNT;
+
+    /**
+     * Restore time
+     */
+    public final Summary RESTORE_TIME;
+
+    /**
+     * Restore error count
+     */
+    public final Counter RESTORE_ERROR_COUNT;
+
+    /**
+     * Restore rate limited count
+     */
+    public final Counter RESTORE_RATE_LIMITED_COUNT;
 
     /**
      * Db init time (snapshot loading + txnlog replay)
@@ -293,6 +354,7 @@ public final class ServerMetrics {
     public final Summary PROPAGATION_LATENCY;
 
     public final Summary FOLLOWER_SYNC_TIME;
+    public final Summary OBSERVER_SYNC_TIME;
 
     public final Summary ELECTION_TIME;
 
@@ -309,6 +371,9 @@ public final class ServerMetrics {
     // Expiry queue stats
     public final Counter SESSIONLESS_CONNECTIONS_EXPIRED;
     public final Counter STALE_SESSIONS_EXPIRED;
+
+    public final Summary UNAVAILABLE_TIME;
+    public final Summary LEADER_UNAVAILABLE_TIME;
 
     // Connection throttling related
     public final Summary CONNECTION_TOKEN_DEFICIT;
@@ -502,6 +567,41 @@ public final class ServerMetrics {
     public final Counter WATCH_BYTES;
 
     public final Summary JVM_PAUSE_TIME;
+
+    public final CounterSet QUOTA_EXCEEDED_ERROR_PER_NAMESPACE;
+
+    /**
+     * Count of created and deleted TTL nodes
+     */
+    public final Counter TTL_NODE_DELETED_COUNT;
+    public final Counter TTL_NODE_CREATED_COUNT;
+
+    // Operation count metrics
+    public final Counter OP_COUNT_TOTAL;
+    public final Counter OP_COUNT_ADD_WATCH;
+    public final Counter OP_COUNT_CHECK;
+    public final Counter OP_COUNT_CHECK_WATCHES;
+    public final Counter OP_COUNT_CLOSE_SESSION;
+    public final Counter OP_COUNT_CREATE;
+    public final Counter OP_COUNT_CREATE_SESSION;
+    public final Counter OP_COUNT_DELETE;
+    public final Counter OP_COUNT_EXISTS;
+    public final Counter OP_COUNT_GET_ACL;
+    public final Counter OP_COUNT_GET_ALL_CHILDREN_NUMBER;
+    public final Counter OP_COUNT_GET_CHILDREN;
+    public final Counter OP_COUNT_GET_DATA;
+    public final Counter OP_COUNT_GET_EPHEMERALS;
+    public final Counter OP_COUNT_MULTI;
+    public final Counter OP_COUNT_MULTI_READ;
+    public final Counter OP_COUNT_PING;
+    public final Counter OP_COUNT_RECONFIG;
+    public final Counter OP_COUNT_REMOVE_WATCHES;
+    public final Counter OP_COUNT_SET_ACL;
+    public final Counter OP_COUNT_SET_DATA;
+    public final Counter OP_COUNT_SET_WATCHES;
+    public final Counter OP_COUNT_SYNC;
+    public final Counter OP_COUNT_WHO_AM_I;
+
 
     private final MetricsProvider metricsProvider;
 

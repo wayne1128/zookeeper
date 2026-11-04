@@ -22,10 +22,13 @@ import java.io.File;
 import java.io.FileWriter;
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import org.apache.jute.compiler.generated.RccConstants;
+import org.apache.jute.compiler.generated.Token;
 
 /**
  *
@@ -36,11 +39,12 @@ public class JRecord extends JCompType {
     private String mName;
     private String mModule;
     private List<JField> mFields;
+    private Token mRecordToken;
 
     /**
      * Creates a new instance of JRecord.
      */
-    public JRecord(String name, ArrayList<JField> flist) {
+    public JRecord(String name, ArrayList<JField> flist, Token recordToken) {
         super("struct " + name.substring(name.lastIndexOf('.') + 1),
                 name.replaceAll("\\.", "::"), getCsharpFQName(name), name, "Record", name, getCsharpFQName("IRecord"));
         mFQName = name;
@@ -48,10 +52,15 @@ public class JRecord extends JCompType {
         mName = name.substring(idx + 1);
         mModule = name.substring(0, idx);
         mFields = flist;
+        mRecordToken = recordToken;
     }
 
     public String getName() {
         return mName;
+    }
+
+    public Token getRecordToken() {
+        return mRecordToken;
     }
 
     public String getCsharpName() {
@@ -143,7 +152,7 @@ public class JRecord extends JCompType {
         return "    a_.WriteRecord(" + fname + ",\"" + tag + "\");\n";
     }
 
-    static Map<String, String> vectorStructs = new HashMap<String, String>();
+    static Map<String, String> vectorStructs = new HashMap<>();
 
     public void genCCode(FileWriter h, FileWriter c) throws IOException {
         for (JField f : mFields) {
@@ -208,8 +217,17 @@ public class JRecord extends JCompType {
             }
         }
         String recName = getName();
+
+        String recordComments = getRecordComments();
+        if (recordComments != null && !recordComments.isEmpty()) {
+            h.write(recordComments);
+        }
         h.write("struct " + recName + " {\n");
         for (JField f : mFields) {
+            String fieldComments = getCFieldComments(f);
+            if (fieldComments != null && !fieldComments.isEmpty()) {
+                h.write(fieldComments);
+            }
             h.write(f.genCDecl());
         }
         h.write("};\n");
@@ -407,7 +425,7 @@ public class JRecord extends JCompType {
         if (!pkgdir.exists()) {
             // create the pkg directory
             if (!pkgdir.mkdirs()) {
-                throw new IOException("Cannnot create directory: " + pkgpath);
+                throw new IOException("Cannot create directory: " + pkgpath);
             }
         } else if (!pkgdir.isDirectory()) {
             throw new IOException(pkgpath + " is not a directory.");
@@ -436,10 +454,18 @@ public class JRecord extends JCompType {
             jj.write("import org.apache.jute.*;\n");
             jj.write("import org.apache.jute.Record; // JDK14 needs explicit import due to clash with java.lang.Record\n");
             jj.write("import org.apache.yetus.audience.InterfaceAudience;\n");
+            String recordComments = getRecordComments();
+            if (recordComments != null && !recordComments.isEmpty()) {
+                jj.write(recordComments);
+            }
             jj.write("@InterfaceAudience.Public\n");
             jj.write("public class " + getName() + " implements Record {\n");
             for (Iterator<JField> i = mFields.iterator(); i.hasNext(); ) {
                 JField jf = i.next();
+                String fieldComments = getJavaFieldComments(jf);
+                if (fieldComments != null && !fieldComments.isEmpty()) {
+                    jj.write(fieldComments);
+                }
                 jj.write(jf.genJavaDecl());
             }
             jj.write("  public " + getName() + "() {\n");
@@ -465,6 +491,16 @@ public class JRecord extends JCompType {
                 JField jf = i.next();
                 jj.write(jf.genJavaGetSet(fIdx));
             }
+
+            jj.write("\n");
+            jj.write("  public void copyFrom(" + getName() + " from) {\n");
+            fIdx = 0;
+            for (Iterator<JField> i = mFields.iterator(); i.hasNext(); fIdx++) {
+                JField jf = i.next();
+                jj.write("    " + jf.getName() + " = from." + jf.getName() + ";\n");
+            }
+            jj.write("  }\n");
+
             jj.write("  public void serialize(OutputArchive a_, String tag) throws java.io.IOException {\n");
             jj.write("    a_.startRecord(this,tag);\n");
             fIdx = 0;
@@ -498,7 +534,7 @@ public class JRecord extends JCompType {
                 jj.write(jf.genJavaWriteMethodName());
             }
             jj.write("      a_.endRecord(this,\"\");\n");
-            jj.write("      return new String(s.toByteArray(), \"UTF-8\");\n");
+            jj.write("      return new String(s.toByteArray(), java.nio.charset.StandardCharsets.UTF_8);\n");
             jj.write("    } catch (Throwable ex) {\n");
             jj.write("      ex.printStackTrace();\n");
             jj.write("    }\n");
@@ -580,7 +616,7 @@ public class JRecord extends JCompType {
         if (!outputDirectory.exists()) {
             // create the pkg directory
             if (!outputDirectory.mkdirs()) {
-                throw new IOException("Cannnot create directory: " + outputDirectory);
+                throw new IOException("Cannot create directory: " + outputDirectory);
             }
         } else if (!outputDirectory.isDirectory()) {
             throw new IOException(outputDirectory + " is not a directory.");
@@ -766,5 +802,123 @@ public class JRecord extends JCompType {
             }
         }
         return fQName.toString();
+    }
+
+    public String getJavaFieldComments(JField jField) {
+        return getFieldComments(jField, "  ");
+    }
+
+    public String getCFieldComments(JField jField) {
+        return getFieldComments(jField, "    ");
+    }
+
+    private String getFieldComments(JField jField, String indent) {
+        if (jField == null || jField.getTypeToken() == null || jField.getNextToken() == null) {
+            return "";
+        }
+
+        // get the comment before the line
+        Token beforeTheLineCommentToken = getCommentToken(jField.getTypeToken(), jField.getPreviousToken());
+        List<String> comments = extractComments(beforeTheLineCommentToken, Integer.MAX_VALUE);
+
+        Token endOfLineCommentToken = getCommentToken(jField.getNextToken(), null);
+        if (endOfLineCommentToken != null && jField.getTypeToken().beginLine == endOfLineCommentToken.beginLine) {
+
+            comments.addAll(extractComments(endOfLineCommentToken, endOfLineCommentToken.beginLine));
+        }
+
+        return formatComments(indent, comments);
+    }
+
+    private Token getCommentToken(Token token, Token previousToken) {
+        if (token == null || token.specialToken == null) {
+            return null;
+        }
+
+        Token commentToken = token.specialToken;
+        while (commentToken.specialToken != null) {
+            commentToken = commentToken.specialToken;
+        }
+        // Skip end of line comment belong to previous token.
+        while (previousToken != null && commentToken != null && commentToken.beginLine == previousToken.endLine) {
+            commentToken = commentToken.next;
+        }
+        return commentToken;
+    }
+
+    public String getRecordComments() {
+        if (getRecordToken() == null || getRecordToken().specialToken == null) {
+            return "";
+        }
+
+        // get the comments before the class
+        Token commentToken = getCommentToken(getRecordToken(), null);
+        return formatComments("", extractComments(commentToken, Integer.MAX_VALUE));
+    }
+
+    private static String formatComments(String indent, List<String> commentLines) {
+        if (commentLines == null || commentLines.isEmpty()) {
+            return "";
+        }
+
+        StringBuilder builder = new StringBuilder();
+        for (String line : commentLines) {
+            if (!line.isEmpty()) {
+                builder.append(indent).append(line);
+            }
+            builder.append(System.lineSeparator());
+        }
+
+        return builder.toString();
+    }
+
+    /**
+     * Extracts comments with indentation and line separator trimmed.
+     *
+     * <p>Empty line is represented as empty string.
+     */
+    private static List<String> extractComments(Token token, int endLine) {
+        List<String> comments = new ArrayList<>();
+
+        if (token == null) {
+            return comments;
+        }
+
+        int nextLine = token.beginLine;
+        while (token != null && token.beginLine <= endLine) {
+            while (nextLine < token.beginLine) {
+                comments.add("");
+                nextLine++;
+            }
+            nextLine = token.endLine + 1;
+            switch (token.kind) {
+                case RccConstants.ONE_LINE_COMMENT:
+                    comments.add(token.image);
+                    break;
+                case RccConstants.MULTI_LINE_COMMENT: {
+                    List<String> lines = Arrays.asList(token.image.split("\r|\n|\r\n"));
+                    // First line captures no indentation.
+                    comments.add(lines.get(0));
+                    int indentSpaces = token.beginColumn - 1;
+                    for (int i = 1; i < lines.size(); i++) {
+                        String line = lines.get(i);
+                        int j = 0;
+                        while (j < indentSpaces && j < line.length()) {
+                            if (line.charAt(j) != ' ') {
+                                break;
+                            }
+                            j++;
+                        }
+                        comments.add(line.substring(j));
+                    }
+                }
+                break;
+                default:
+                    throw new IllegalStateException("expect comment token, but get token kind " + token.kind);
+            }
+            token = token.next;
+        }
+
+        return comments;
     }
 }

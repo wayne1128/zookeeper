@@ -24,6 +24,8 @@ import java.io.DataOutputStream;
 import java.io.IOException;
 import java.net.Socket;
 import java.util.Set;
+import java.util.function.Supplier;
+import javax.security.auth.callback.CallbackHandler;
 import javax.security.auth.login.AppConfigurationEntry;
 import javax.security.auth.login.Configuration;
 import javax.security.auth.login.LoginException;
@@ -45,6 +47,7 @@ public class SaslQuorumAuthServer implements QuorumAuthServer {
     private static final int MAX_RETRIES = 5;
     private final Login serverLogin;
     private final boolean quorumRequireSasl;
+    private final ZKConfig zkConfig;
 
     public SaslQuorumAuthServer(boolean quorumRequireSasl, String loginContext, Set<String> authzHosts) throws SaslException {
         this.quorumRequireSasl = quorumRequireSasl;
@@ -55,9 +58,11 @@ public class SaslQuorumAuthServer implements QuorumAuthServer {
                     "SASL-authentication failed because the specified JAAS configuration section '%s' could not be found.",
                     loginContext));
             }
-            SaslQuorumServerCallbackHandler saslServerCallbackHandler = new SaslQuorumServerCallbackHandler(
-                Configuration.getConfiguration(), loginContext, authzHosts);
-            serverLogin = new Login(loginContext, saslServerCallbackHandler, new ZKConfig());
+            Supplier<CallbackHandler> callbackSupplier = () -> {
+                return new SaslQuorumServerCallbackHandler(entries, authzHosts);
+            };
+            zkConfig = new ZKConfig();
+            serverLogin = new Login(loginContext, callbackSupplier, zkConfig);
             serverLogin.startThreadIfNeeded();
         } catch (Throwable e) {
             throw new SaslException("Failed to initialize authentication mechanism using SASL", e);
@@ -83,11 +88,15 @@ public class SaslQuorumAuthServer implements QuorumAuthServer {
             dout = new DataOutputStream(sock.getOutputStream());
             byte[] challenge = null;
             ss = SecurityUtils.createSaslServer(
+                zkConfig,
                 serverLogin.getSubject(),
                 QuorumAuth.QUORUM_SERVER_PROTOCOL_NAME,
                 QuorumAuth.QUORUM_SERVER_SASL_DIGEST,
-                serverLogin.callbackHandler,
+                serverLogin.newCallbackHandler(),
                 LOG);
+            if (ss == null) {
+                throw new SaslException("Failed to create SaslServer (FIPS mode may be blocking DIGEST-MD5)");
+            }
             while (!ss.isComplete()) {
                 challenge = ss.evaluateResponse(token);
                 if (!ss.isComplete()) {
@@ -144,6 +153,13 @@ public class SaslQuorumAuthServer implements QuorumAuthServer {
                     LOG.error("SaslServer dispose() failed", e);
                 }
             }
+        }
+    }
+
+    @Override
+    public void shutdown() {
+        if (serverLogin != null) {
+            serverLogin.shutdown();
         }
     }
 

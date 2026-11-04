@@ -50,15 +50,17 @@ struct buff_struct {
 static int resize_buffer(struct buff_struct *s, int newlen)
 {
     char *buffer= NULL;
-    while (s->len < newlen) {
-        s->len *= 2;
+    int32_t len = s->len;
+    while (len < newlen) {
+        len *= 2;
     }
-    buffer = (char*)realloc(s->buffer, s->len);
+    buffer = (char*)realloc(s->buffer, len);
     if (!buffer) {
-        s->buffer = 0;
+        /* Preserve existing buffer on allocation failure. Owner will free. */
         return -ENOMEM;
     }
     s->buffer = buffer;
+    s->len = len;
     return 0;
 }
 
@@ -145,7 +147,7 @@ int oa_serialize_buffer(struct oarchive *oa, const char *name,
         return rc;
     // this means a buffer of NUll 
     // with size of -1. This is 
-    // waht we use in java serialization for NULL
+    // what we use in java serialization for NULL
     if (b->len == -1) {
       return rc;
     }

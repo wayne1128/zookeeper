@@ -18,12 +18,12 @@
 
 package org.apache.zookeeper.test;
 
-import static org.junit.Assert.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import org.apache.zookeeper.PortAssignment;
 import org.apache.zookeeper.Watcher;
 import org.apache.zookeeper.ZooKeeper;
 import org.apache.zookeeper.server.quorum.QuorumPeerTestBase;
-import org.junit.Test;
+import org.junit.jupiter.api.Test;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -56,7 +56,7 @@ public class ObserverTest extends QuorumPeerTestBase implements Watcher {
      * (and will not come up with standalone server).
      */
     @Test
-    public void testObserverWithStandlone() throws Exception {
+    public void testObserverWithStandalone() throws Exception {
         ClientBase.setupTestEnv();
         final int CLIENT_PORT_QP1 = PortAssignment.unique();
 

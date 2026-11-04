@@ -17,9 +17,9 @@
  */
 package org.apache.zookeeper.audit;
 
-import static org.junit.Assert.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import org.apache.zookeeper.audit.AuditEvent.Result;
-import org.junit.Test;
+import org.junit.jupiter.api.Test;
 
 public class AuditEventTest {
 
@@ -40,6 +40,16 @@ public class AuditEventTest {
         auditEvent.addEntry(AuditEvent.FieldName.OPERATION, "Value2");
         String actual = auditEvent.toString();
         String expected = "operation=Value2\tresult=success";
+        assertEquals(expected, actual);
+    }
+
+    @Test
+    public void testSanitizeInvalidOutput() {
+        AuditEvent auditEvent = new AuditEvent(Result.SUCCESS);
+        auditEvent.addEntry(AuditEvent.FieldName.USER, "Value1");
+        auditEvent.addEntry(AuditEvent.FieldName.OPERATION, "\nfake\toperation=delete\rznode=/forged:pw");
+        String actual = auditEvent.toString();
+        String expected = "user=Value1\toperation=fakeoperation=deleteznode=/forged:pw\tresult=success";
         assertEquals(expected, actual);
     }
 }

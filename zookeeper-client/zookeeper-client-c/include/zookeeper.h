@@ -108,7 +108,7 @@ enum ZOO_ERRORS {
   ZBADARGUMENTS = -8, /*!< Invalid arguments */
   ZINVALIDSTATE = -9, /*!< Invliad zhandle state */
   ZNEWCONFIGNOQUORUM = -13, /*!< No quorum of new config is connected and
-                                 up-to-date with the leader of last commmitted
+                                 up-to-date with the leader of last committed
                                  config - try invoking reconfiguration after new
                                  servers are connected and synced */
   ZRECONFIGINPROGRESS = -14, /*!< Reconfiguration requested while another
@@ -140,7 +140,7 @@ enum ZOO_ERRORS {
   ZEPHEMERALONLOCALSESSION = -120, /*!< Attempt to create ephemeral node on a local session */
   ZNOWATCHER = -121, /*!< The watcher couldn't be found */
   ZRECONFIGDISABLED = -123, /*!< Attempts to perform a reconfiguration operation when reconfiguration feature is disabled */
-  ZSESSIONCLOSEDREQUIRESASLAUTH = -124, /*!< The session has been closed by server because server requires client to do SASL authentication, but client is not configured with SASL authentication or configuted with SASL but failed (i.e. wrong credential used.). */
+  ZSESSIONCLOSEDREQUIRESASLAUTH = -124, /*!< The session has been closed by server because server requires client to do authentication via configured authentication scheme at server, but client is not configured with required authentication scheme or configured but failed (i.e. wrong credential used.). */
   ZTHROTTLEDOP = -127 /*!< Operation was throttled and not executed at all. please, retry! */
 
   /* when adding/changing values here also update zerror(int) to return correct error message */
@@ -537,6 +537,38 @@ ZOOAPI zhandle_t *zookeeper_init(const char *host, watcher_fn fn,
   int recv_timeout, const clientid_t *clientid, void *context, int flags);
 
 #ifdef HAVE_OPENSSL_H
+/**
+ * \brief create a handle to communicate with zookeeper using SSL.
+ *
+ * This method creates a new handle and a zookeeper session that corresponds
+ * to that handle. Session establishment is asynchronous, meaning that the
+ * session should not be considered established until (and unless) an
+ * event of state ZOO_CONNECTED_STATE is received.
+ * \param host comma separated host:port pairs, each corresponding to a zk
+ *   server. e.g. "127.0.0.1:3000,127.0.0.1:3001,127.0.0.1:3002"
+ * \param cert SSL certificate string. Two formats are supported: server CA
+ *   only e.g. "/path/to/server_ca.cer" and server CA with client certificate e.g.
+ *   "/path/to/server_ca.cer,/path/to/client_cert.pem,/path/to/client_cert.key,client_cert_password".
+ * \param fn the global watcher callback function. When notifications are
+ *   triggered this function will be invoked.
+ * \param recv_timeout the timeout for the zookeeper session.
+ * \param clientid the id of a previously established session that this
+ *   client will be reconnecting to. Pass 0 if not reconnecting to a previous
+ *   session. Clients can access the session id of an established, valid,
+ *   connection by calling \ref zoo_client_id. If the session corresponding to
+ *   the specified clientid has expired, or if the clientid is invalid for
+ *   any reason, the returned zhandle_t will be invalid -- the zhandle_t
+ *   state will indicate the reason for failure (typically
+ *   ZOO_EXPIRED_SESSION_STATE).
+ * \param context the handback object that will be associated with this instance
+ *   of zhandle_t. Application can access it (for example, in the watcher
+ *   callback) using \ref zoo_get_context. The object is not used by zookeeper
+ *   internally and can be null.
+ * \param flags reserved for future use. Should be set to zero.
+ * \return a pointer to the opaque zhandle structure. If it fails to create
+ * a new zhandle the function returns NULL and the errno variable
+ * indicates the reason.
+ */
 ZOOAPI zhandle_t *zookeeper_init_ssl(const char *host, const char *cert, watcher_fn fn,
   int recv_timeout, const clientid_t *clientid, void *context, int flags);
 #endif
@@ -655,19 +687,110 @@ ZOOAPI zhandle_t *zookeeper_init_sasl(const char *host, watcher_fn fn,
  * is not mandatory; you can still implement interactive dialogs by
  * defining your own callbacks.
  *
+ * The returned array is an opaque contiguous allocation containing the
+ * callbacks and copies of the provided parameters. Do not resize the array
+ * or deallocate individual entries or contexts. Passwords are limited to
+ * 1023 characters. Longer passwords will fail with \c SASL_BUFOVER.
+ *
+ * Multiple handles may share a callback array provided credentials do not
+ * change while any handle is open. If credentials can change (e.g. password
+ * file rotation), allocate a separate callback array for each handle.
+ *
  * \param user the "canned" response to \c SASL_CB_USER and \c SASL_CB_AUTHNAME,
  *   or NULL for none
  * \param realm the "canned" response to \c SASL_CB_GETREALM, or NULL for none
  * \param password_file the name of a file whose first line is read in
- *   response to \c SASL_CB_PASS, or NULL for none
- * \return the freshly-malloc()ed callbacks array, or NULL if allocation
- *   failed.  Deallocate with free(), but only after the corresponding
- *   ZooKeeper handle is closed.
+ *   response to \c SASL_CB_PASS, or NULL to prompt for the password at
+ *   the terminal
+ * \return the callbacks array, or NULL if allocation failed. Deallocate
+ *   with free(), but only after all ZooKeeper handles using it are
+ *   closed.
  */
 ZOOAPI sasl_callback_t *zoo_sasl_make_basic_callbacks(const char *user,
   const char *realm, const char* password_file);
 
+/**
+ * \brief signature of the callback function for SASL password.
+ *
+ * This callback is defined by user to decrypt the content of password file with
+ * context into the actual password.
+ *
+ * \param content the string read from the password file.
+ * \param content_len the size of the content in bytes.
+ * \param context the handback object that will be associated with the password
+ *   file. The object is not used by zookeeper internally and can be null.
+ * \param buf the buffer where the resulting actual password is saved.
+ * \param buf_len the size of buf in bytes, which is also the max allowed
+ *   password length.
+ * \param passwd_len as an output parameter of the callback function, passwd_len
+ *   points to the actual length of the password stored in buf. Its size must not
+ *   exceed buf_len; otherwise, SASL_BUFOVER will be returned.
+ * \return SASL_OK, or the possible errors defined by the SASL library.
+ */
+typedef int (*zoo_sasl_password_callback_t)(const char *content, size_t content_len,
+        void *context, char *buf, size_t buf_len, size_t *passwd_len);
+
+/**
+ * \brief zoo_sasl_password structure.
+ *
+ * This structure holds the parameters for getting the actual SASL password. The
+ * user-defined callback is a processor that decrypts the content of password_file
+ * with context as a handback object helping the decryption into the actual password
+ * as is described above for zoo_sasl_password_callback_t.
+ *
+ * All of password_file, context and callback are allowed to be null; however, once
+ * callback is defined, password_file should not be null since the content processed
+ * by callback is from password_file. If callback is null and password_file is given,
+ * the first line of the file is just the actual password. While both password_file
+ * and callback are null, the password would be read from terminal with prompt.
+ *
+ * zoo_sasl_password is defined by user and used to generate the actual password in
+ * response to \c SASL_CB_PASS.
+ */
+typedef struct zoo_sasl_password {
+  const char *password_file;                /*!< The path of the password file */
+  void *context;                            /*!< The handback object used by callback */
+  zoo_sasl_password_callback_t callback;    /*!< Callback over the content of password file */
+} zoo_sasl_password_t;
+
+/**
+ * \brief allocates and initializes a basic array of Cyrus SASL callbacks.
+ *
+ * This helper function is similar to zoo_sasl_make_basic_callbacks, except that
+ * the actual password is generated by zoo_sasl_password object rather than just
+ * read from the password file.
+ *
+ * The returned array follows the same contract as
+ * \ref zoo_sasl_make_basic_callbacks. Passwords are subject to the same
+ * 1023 character limit and fail with \c SASL_BUFOVER if exceeded.
+ *
+ * \param user the "canned" response to \c SASL_CB_USER and \c SASL_CB_AUTHNAME,
+ *   or NULL for none.
+ * \param realm the "canned" response to \c SASL_CB_GETREALM, or NULL for none.
+ * \param password the object defined by user to specify how the actual password
+ *   is generated in response to \c SASL_CB_PASS, should never be NULL (otherwise
+ *   the behaviour is undefined), see struct zoo_sasl_password for details.
+ * \return the callbacks array, or NULL if allocation failed. Deallocate
+ *   with free(), but only after all ZooKeeper handles using it are
+ *   closed.
+ */
+ZOOAPI sasl_callback_t *zoo_sasl_make_password_callbacks(const char *user,
+  const char *realm, zoo_sasl_password_t *password);
+
 #endif /* HAVE_CYRUS_SASL_H */
+
+
+/**
+ * \brief return ZOO_VERSION from loaded library as a string.
+ *
+ * This method allows a calling program to determine at runtime whether the
+ * version of the dynamically loaded zookeeper library (a.k.a. zoo_version_str())
+ * is same as the version of the library the calling program was compiled against
+ * (a.k.a. ZOO_VERSION).
+ *
+ * \return a string in shape "MAJOR.MINOR.PATCH", say "3.10.0"
+ */
+ZOOAPI const char* zoo_version_str();
 
 /**
  * \brief update the list of servers this client will connect to.
@@ -697,7 +820,7 @@ ZOOAPI sasl_callback_t *zoo_sasl_make_basic_callbacks(const char *user,
  * \return ZOK on success or one of the following errcodes on failure:
  * ZBADARGUMENTS - invalid input parameters
  * ZINVALIDSTATE - zhandle state is either ZOO_SESSION_EXPIRED_STATE or ZOO_AUTH_FAILED_STATE
- * ZSYSTEMERROR -- a system (OS) error occured; it's worth checking errno to get details
+ * ZSYSTEMERROR -- a system (OS) error occurred; it's worth checking errno to get details
  */
 ZOOAPI int zoo_set_servers(zhandle_t *zh, const char *hosts);
 
@@ -716,7 +839,7 @@ ZOOAPI int zoo_set_servers(zhandle_t *zh, const char *hosts);
  * This method allows an application to influence the rate of polling.
  * When delay_ms is set to a value greater than zero, the client skips
  * most "routine" resolutions which would have happened in a window of
- * that many milliseconds since the last succesful one.
+ * that many milliseconds since the last successful one.
  *
  * Setting delay_ms to 0 disables this logic, reverting to the default
  * behavior.  Setting it to -1 disables network resolutions during
@@ -762,6 +885,12 @@ ZOOAPI const char* zoo_get_current_server(zhandle_t* zh);
  * This method should only be called only once on a zookeeper handle. Calling
  * twice will cause undefined (and probably undesirable behavior). Calling any other
  * zookeeper method after calling close is undefined behaviour and should be avoided.
+ *
+ * In the multithreaded library, a callback that runs on the IO thread (for
+ * example an authentication completion) can call this function. In that case,
+ * completions and watcher events that are queued after the completion thread
+ * stops are released without being invoked, so their data is not handed back
+ * to the caller.
  *
  * \param zh the zookeeper handle obtained by a call to \ref zookeeper_init
  * \return a result code. Regardless of the error code returned, the zhandle
@@ -876,7 +1005,11 @@ ZOOAPI int zookeeper_process(zhandle_t *zh, int events);
  * \param data the pointer that was passed by the caller when the function
  *   that this completion corresponds to was invoked. The programmer
  *   is responsible for any memory freeing associated with the data
- *   pointer.
+ *   pointer. If an asynchronous call (zoo_a*) fails synchronously
+ *   (returns non-ZOK), the completion callback will not be invoked
+ *   and the caller retains ownership of this data (except for zoo_add_auth()).
+ *   Otherwise the completion is invoked, except when the handle is closed
+ *   from the IO thread (see \ref zookeeper_close).
  */
 typedef void (*void_completion_t)(int rc, const void *data);
 
@@ -898,7 +1031,11 @@ typedef void (*void_completion_t)(int rc, const void *data);
  * \param data the pointer that was passed by the caller when the function
  *   that this completion corresponds to was invoked. The programmer
  *   is responsible for any memory freeing associated with the data
- *   pointer.
+ *   pointer. If an asynchronous call (zoo_a*) fails synchronously
+ *   (returns non-ZOK), the completion callback will not be invoked
+ *   and the caller retains ownership of this data (except for zoo_add_auth()).
+ *   Otherwise the completion is invoked, except when the handle is closed
+ *   from the IO thread (see \ref zookeeper_close).
  */
 typedef void (*stat_completion_t)(int rc, const struct Stat *stat,
         const void *data);
@@ -925,7 +1062,11 @@ typedef void (*stat_completion_t)(int rc, const struct Stat *stat,
  * \param data the pointer that was passed by the caller when the function
  *   that this completion corresponds to was invoked. The programmer
  *   is responsible for any memory freeing associated with the data
- *   pointer.
+ *   pointer. If an asynchronous call (zoo_a*) fails synchronously
+ *   (returns non-ZOK), the completion callback will not be invoked
+ *   and the caller retains ownership of this data (except for zoo_add_auth()).
+ *   Otherwise the completion is invoked, except when the handle is closed
+ *   from the IO thread (see \ref zookeeper_close).
  */
 typedef void (*data_completion_t)(int rc, const char *value, int value_len,
         const struct Stat *stat, const void *data);
@@ -949,7 +1090,11 @@ typedef void (*data_completion_t)(int rc, const char *value, int value_len,
  * \param data the pointer that was passed by the caller when the function
  *   that this completion corresponds to was invoked. The programmer
  *   is responsible for any memory freeing associated with the data
- *   pointer.
+ *   pointer. If an asynchronous call (zoo_a*) fails synchronously
+ *   (returns non-ZOK), the completion callback will not be invoked
+ *   and the caller retains ownership of this data (except for zoo_add_auth()).
+ *   Otherwise the completion is invoked, except when the handle is closed
+ *   from the IO thread (see \ref zookeeper_close).
  */
 typedef void (*strings_completion_t)(int rc,
         const struct String_vector *strings, const void *data);
@@ -974,7 +1119,11 @@ typedef void (*strings_completion_t)(int rc,
  * \param data the pointer that was passed by the caller when the function
  *   that this completion corresponds to was invoked. The programmer
  *   is responsible for any memory freeing associated with the data
- *   pointer.
+ *   pointer. If an asynchronous call (zoo_a*) fails synchronously
+ *   (returns non-ZOK), the completion callback will not be invoked
+ *   and the caller retains ownership of this data (except for zoo_add_auth()).
+ *   Otherwise the completion is invoked, except when the handle is closed
+ *   from the IO thread (see \ref zookeeper_close).
  */
 typedef void (*string_stat_completion_t)(int rc,
         const char *string, const struct Stat *stat, const void *data);
@@ -1002,7 +1151,11 @@ typedef void (*string_stat_completion_t)(int rc,
  * \param data the pointer that was passed by the caller when the function
  *   that this completion corresponds to was invoked. The programmer
  *   is responsible for any memory freeing associated with the data
- *   pointer.
+ *   pointer. If an asynchronous call (zoo_a*) fails synchronously
+ *   (returns non-ZOK), the completion callback will not be invoked
+ *   and the caller retains ownership of this data (except for zoo_add_auth()).
+ *   Otherwise the completion is invoked, except when the handle is closed
+ *   from the IO thread (see \ref zookeeper_close).
  */
 typedef void (*strings_stat_completion_t)(int rc,
         const struct String_vector *strings, const struct Stat *stat,
@@ -1024,7 +1177,11 @@ typedef void (*strings_stat_completion_t)(int rc,
  * \param data the pointer that was passed by the caller when the function
  *   that this completion corresponds to was invoked. The programmer
  *   is responsible for any memory freeing associated with the data
- *   pointer.
+ *   pointer. If an asynchronous call (zoo_a*) fails synchronously
+ *   (returns non-ZOK), the completion callback will not be invoked
+ *   and the caller retains ownership of this data (except for zoo_add_auth()).
+ *   Otherwise the completion is invoked, except when the handle is closed
+ *   from the IO thread (see \ref zookeeper_close).
  */
 typedef void
         (*string_completion_t)(int rc, const char *value, const void *data);
@@ -1050,7 +1207,11 @@ typedef void
  * \param data the pointer that was passed by the caller when the function
  *   that this completion corresponds to was invoked. The programmer
  *   is responsible for any memory freeing associated with the data
- *   pointer.
+ *   pointer. If an asynchronous call (zoo_a*) fails synchronously
+ *   (returns non-ZOK), the completion callback will not be invoked
+ *   and the caller retains ownership of this data (except for zoo_add_auth()).
+ *   Otherwise the completion is invoked, except when the handle is closed
+ *   from the IO thread (see \ref zookeeper_close).
  */
 typedef void (*acl_completion_t)(int rc, struct ACL_vector *acl,
         struct Stat *stat, const void *data);
@@ -1779,7 +1940,7 @@ typedef enum {
  * \param wtype the watcher type to be removed
  * \param watcher the watcher to be removed, if null all watches for that
  * path (and watcher type) will be removed
- * \param watcherCtx the contex associated with the watcher to be removed
+ * \param watcherCtx the context associated with the watcher to be removed
  * \param local whether the watches will be removed locally even if there is
  * no server connection
  * \return the return code for the function call.
@@ -1789,7 +1950,7 @@ typedef enum {
  * or ZOO_AUTH_FAILED_STATE
  * ZBADARGUMENTS - invalid input parameters
  * ZMARSHALLINGERROR - failed to marshall a request; possibly, out of memory
- * ZSYSTEMERROR - a system error occured
+ * ZSYSTEMERROR - a system error occurred
  */
 ZOOAPI int zoo_aremove_watches(zhandle_t *zh, const char *path,
         ZooWatcherType wtype, watcher_fn watcher, void *watcherCtx, int local,
@@ -1810,7 +1971,7 @@ ZOOAPI int zoo_aremove_watches(zhandle_t *zh, const char *path,
  * or ZOO_AUTH_FAILED_STATE
  * ZBADARGUMENTS - invalid input parameters
  * ZMARSHALLINGERROR - failed to marshall a request; possibly, out of memory
- * ZSYSTEMERROR - a system error occured
+ * ZSYSTEMERROR - a system error occurred
  */
 ZOOAPI int zoo_remove_all_watches(zhandle_t *zh, const char *path,
         ZooWatcherType wtype, int local);
@@ -1830,7 +1991,7 @@ ZOOAPI int zoo_remove_all_watches(zhandle_t *zh, const char *path,
  * or ZOO_AUTH_FAILED_STATE
  * ZBADARGUMENTS - invalid input parameters
  * ZMARSHALLINGERROR - failed to marshall a request; possibly, out of memory
- * ZSYSTEMERROR - a system error occured
+ * ZSYSTEMERROR - a system error occurred
 */
 ZOOAPI int zoo_aremove_all_watches(zhandle_t *zh, const char *path,
         ZooWatcherType wtype, int local, void_completion_t *completion,
@@ -2434,7 +2595,7 @@ ZOOAPI int zoo_multi(zhandle_t *zh, int count, const zoo_op_t *ops, zoo_op_resul
  * \param wtype the watcher type to be removed
  * \param watcher the watcher to be removed, if null all watches for that
  * path (and watcher type) will be removed
- * \param watcherCtx the contex associated with the watcher to be removed
+ * \param watcherCtx the context associated with the watcher to be removed
  * \param local whether the watches will be removed locally even if there is
  * no server connection
  * \return the return code for the function call.
@@ -2444,7 +2605,7 @@ ZOOAPI int zoo_multi(zhandle_t *zh, int count, const zoo_op_t *ops, zoo_op_resul
  * or ZOO_AUTH_FAILED_STATE
  * ZBADARGUMENTS - invalid input parameters
  * ZMARSHALLINGERROR - failed to marshall a request; possibly, out of memory
- * ZSYSTEMERROR - a system error occured
+ * ZSYSTEMERROR - a system error occurred
  */
 ZOOAPI int zoo_remove_watches(zhandle_t *zh, const char *path,
         ZooWatcherType wtype, watcher_fn watcher, void *watcherCtx, int local);

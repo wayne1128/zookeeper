@@ -18,20 +18,20 @@
 
 package org.apache.zookeeper.test;
 
-import static org.junit.Assert.assertTrue;
-import static org.junit.Assert.fail;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.fail;
 import java.io.IOException;
 import java.util.Set;
 import org.apache.zookeeper.ZKTestCase;
 import org.apache.zookeeper.jmx.MBeanRegistry;
 import org.apache.zookeeper.jmx.ZKMBeanInfo;
 import org.apache.zookeeper.server.quorum.QuorumPeer;
-import org.junit.Test;
+import org.junit.jupiter.api.Test;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * This class is intented to ensure the correct functionality of
+ * This class is intended to ensure the correct functionality of
  * {@link QuorumUtil} helper.
  */
 public class QuorumUtilTest extends ZKTestCase {
@@ -41,8 +41,8 @@ public class QuorumUtilTest extends ZKTestCase {
     /**
      * <p>
      * This test ensures that all JXM beans associated to a {@link QuorumPeer}
-     * are unregistered when shuted down ({@link QuorumUtil#shutdown(int)}). It
-     * allows a successfull restarting of several zookeeper servers (
+     * are unregistered when shut down ({@link QuorumUtil#shutdown(int)}). It
+     * allows a successful restarting of several zookeeper servers (
      * {@link QuorumPeer}) running on the same JVM.
      * <p>
      * See ZOOKEEPER-1214 for details.
@@ -77,9 +77,9 @@ public class QuorumUtilTest extends ZKTestCase {
             break;
         }
 
-        LOG.info(">-->> Shuting down server [{}]", firstFollowerIndex);
+        LOG.info(">-->> Shutting down server [{}]", firstFollowerIndex);
         qU.shutdown(firstFollowerIndex);
-        LOG.info(">-->> Shuting down server [{}]", secondFollowerIndex);
+        LOG.info(">-->> Shutting down server [{}]", secondFollowerIndex);
         qU.shutdown(secondFollowerIndex);
         LOG.info(">-->> Restarting server [{}]", firstFollowerIndex);
         qU.restart(firstFollowerIndex);
@@ -88,7 +88,7 @@ public class QuorumUtilTest extends ZKTestCase {
 
         qU.shutdownAll();
         Set<ZKMBeanInfo> pending = MBeanRegistry.getInstance().getRegisteredBeans();
-        assertTrue("The following beans should have been unregistered: " + pending, pending.isEmpty());
+        assertTrue(pending.isEmpty(), "The following beans should have been unregistered: " + pending);
     }
 
 }

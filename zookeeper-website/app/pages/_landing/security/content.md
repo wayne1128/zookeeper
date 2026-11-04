@@ -1,0 +1,591 @@
+<!--
+Licensed to the Apache Software Foundation (ASF) under one
+or more contributor license agreements.  See the NOTICE file
+distributed with this work for additional information
+regarding copyright ownership.  The ASF licenses this file
+to you under the Apache License, Version 2.0 (the
+"License"); you may not use this file except in compliance
+with the License.  You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+
+# ZooKeeper Security
+
+The Apache Software Foundation takes security issues very seriously. Due to the infrastructure nature of the Apache ZooKeeper project specifically, we haven't had many reports over time, but it doesn't mean that we haven't had concerns over some bugs and vulnerabilities. If you have any concern or believe you have uncovered a vulnerability, we suggest that you get in touch via the e-mail address [security@zookeeper.apache.org](mailto:security@zookeeper.apache.org?Subject=[SECURITY]%20My%20security%20issue). In the message, try to provide a description of the issue and ideally a way of reproducing it. Note that this security address should be used only for undisclosed vulnerabilities. Dealing with known issues should be handled regularly via jira and the mailing lists. **Please report any security problems to the project security address before disclosing it publicly.**
+
+The ASF Security team maintains a page with a description of how vulnerabilities are handled, check their [Web page](https://security.apache.org/report/) for more information.
+
+## Security model
+
+ZooKeeper is a coordination service intended for use inside a trusted network, not exposed directly to the Internet. The [Admin Guide](https://zookeeper.apache.org/doc/current/admin-ops/administrators-guide/) states it plainly: "A ZooKeeper ensemble is expected to operate in a trusted computing environment. It is thus recommended deploying ZooKeeper behind a firewall." A fresh ensemble ships with no transport encryption, no peer authentication, and world-readable/writable znodes. Hardening is a shared responsibility between the ZooKeeper project and the operator.
+
+### Security is opt-in
+
+The following controls exist but must be explicitly enabled:
+
+- **Transport encryption** — TLS for client-server and quorum traffic, with optional hostname verification. Disabled by default.
+- **Authentication** — digest (username/password), SASL/Kerberos, or x509/mTLS for clients; SASL or TLS for quorum peers. None are enabled by default.
+- **Access control** — per-znode ACLs using the `world`, `auth`, `digest`, `sasl`, `ip`, or `x509` schemes. ACLs are not applied automatically; unless the application sets a restrictive ACL, nodes are commonly created with the wide-open `OPEN_ACL_UNSAFE` (`world:anyone` with all permissions).
+
+Known limitations of these controls, by design:
+
+- ACLs are **not recursive**. An ACL on a parent znode does not protect its children; each znode's ACL must be set independently.
+- The `ip` ACL scheme matches source IP address and is **spoofable**. Operators must ensure network-level controls prevent IP address forgery on any path that relies on this scheme.
+- The AdminServer's default client IP detection honors the `X-Forwarded-For` header, which can be forged by an attacker to bypass IP-based access controls (see CVE-2024-51504). Operators exposing the AdminServer should configure a trusted proxy or restrict access at the network layer.
+- The `digest` scheme transmits the password during authentication and stores an unsalted SHA-1 hash. Use SASL/Kerberos or mTLS where credential confidentiality is required.
+
+### In scope for security reports
+
+Reports sent to [security@zookeeper.apache.org](mailto:security@zookeeper.apache.org?Subject=[SECURITY]%20My%20security%20issue) are appropriate for:
+
+- Vulnerabilities in the **core ZooKeeper server, Java client library, and AdminServer** published to [Maven Central](https://central.sonatype.com/search?q=g:org.apache.zookeeper) under `org.apache.zookeeper`.
+- Bypass of an **enabled and correctly configured** security control (e.g., authentication bypass when SASL is on, ACL enforcement bugs).
+- Behaviors that contradict documented guarantees in the current [ZooKeeper documentation](https://zookeeper.apache.org/doc/current/).
+
+### Out of scope for security reports
+
+The following are **not** in scope for private disclosure:
+
+- **`zookeeper-contrib` and `zookeeper-recipes`** — these are community contributions not published to Maven Central and carry no security support commitment.
+- **The C CLI example shells** (`cli_st`, `cli_mt`) — these are sample code illustrating C client usage, not production tools (see CVE-2016-5017).
+- **Missing hardening on a default installation** — the default configuration is intentionally minimal. Absence of encryption or authentication on a fresh ensemble is expected behavior, not a vulnerability.
+- **Third-party dependency CVEs** — if a dependency bundled in a ZooKeeper distribution carries a known CVE but poses no direct exploit path through ZooKeeper, this is not a private vulnerability. Please open a public [JIRA](https://issues.apache.org/jira/projects/ZOOKEEPER) ticket or post to the [dev mailing list](https://zookeeper.apache.org/mailinglists.html) instead. See the [ASF reporting guide](https://security.apache.org/report/) for guidance on choosing the right channel.
+
+## Vulnerability reports
+
+- [CVE-2026-115448](#cve-2026-115448)
+- [CVE-2026-100302](#cve-2026-100302)
+- [CVE-2026-100300](#cve-2026-100300)
+- [CVE-2026-100252](#cve-2026-100252)
+- [CVE-2026-100235](#cve-2026-100235)
+- [CVE-2026-84501](#cve-2026-84501)
+- [CVE-2026-84439](#cve-2026-84439)
+- [CVE-2026-79993](#cve-2026-79993)
+- [CVE-2026-59969](#cve-2026-59969)
+- [CVE-2026-59739](#cve-2026-59739)
+- [CVE-2026-24308](#cve-2026-24308)
+- [CVE-2026-24281](#cve-2026-24281)
+- [CVE-2025-58457](#cve-2025-58457)
+- [CVE-2024-51504](#cve-2024-51504)
+- [CVE-2024-23944](#cve-2024-23944)
+- [CVE-2023-44981](#cve-2023-44981)
+- [CVE-2019-0201](#cve-2019-0201)
+- [CVE-2018-8012](#cve-2018-8012)
+- [CVE-2017-5637](#cve-2017-5637)
+- [CVE-2016-5017](#cve-2016-5017)
+
+---
+
+### CVE-2026-115448
+
+**Unbounded recursion in snapshot serialization allows a client to render the server unrecoverable**
+
+**Severity:**
+CVSS 4.0: 8.7 (high) CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:N/VI:N/VA:H/SC:N/SI:N/SA:N
+
+**Affected versions:**
+
+- Apache ZooKeeper 3.9.0 through 3.9.7
+- Apache ZooKeeper 3.8.0 through 3.8.8
+
+**Description:**
+
+Uncontrolled recursion in Apache ZooKeeper. The server serializes its data tree to a snapshot by recursing one stack frame
+per znode level, with no depth bound. A client permitted to create znodes (the default root ACL is open) can build a
+chain of nested znodes deep enough that taking a snapshot exhausts the JVM stack and kills the snapshot thread; sizes
+stay within jute.maxbuffer, so existing limits do not prevent it. This is a denial of service that becomes persistent:
+on restart the server rebuilds the deep tree from its transaction log and fails again while taking the startup snapshot,
+so it does not return to service, and recovery can entail data loss. The same log affects a leader and its followers, so
+it can spread across an ensemble.
+
+This issue affects Apache ZooKeeper 3.8.0 through 3.8.7 and 3.9.0 through 3.9.6. Users are recommended to upgrade to 3.8.8
+or 3.9.7, which fix the issue. As a workaround, use ACLs and authentication to restrict znode creation rather than relying
+on the default open root ACL.
+
+This issue is being tracked as ZOOKEEPER-5097
+
+**Credit:**
+
+- Sai Sreewathsa Kovalluri, Shon Babu, and Kannan K of Innspark Solutions (https://innspark.in/) (reporter)
+- Prasath Jayasundar & PayPal Cyber Security Team (reporter)
+
+**References:**
+
+- https://www.cve.org/CVERecord?id=CVE-2026-115448
+- https://issues.apache.org/jira/browse/ZOOKEEPER-5097
+
+---
+
+### CVE-2026-100302
+
+**Denial of service through unbounded memory allocation in multiRead request handling**
+
+**Severity:** important
+CVSS 4.0: 7.1 (high) CVSS:4.0/AV:N/AC:L/AT:N/PR:L/UI:N/VC:N/VI:N/VA:H/SC:N/SI:N/SA:N
+
+**Affected versions:**
+
+- Apache ZooKeeper 3.9.0 through 3.9.6
+- Apache ZooKeeper 3.8.0 through 3.8.7
+
+**Description:**
+
+Allocation of Resources Without Limits or Throttling in the multiRead request handler of Apache ZooKeeper allows a remote attacker to crash the server (denial of service) with a single small request.
+
+The multiRead handler places no limit on the number of bundled read operations or on the cumulative size of the response it builds in memory. Because each operation's result is fully materialized and retained before serialization, a request that is small on the wire — within the jute.maxbuffer limit — but that references a large znode many times can force the server to allocate far more heap than the request size implies, exhausting the JVM heap and terminating the server with an OutOfMemoryError. Neither jute.maxbuffer nor largeRequestMaxBytes prevents this, as both bound only the inbound request, not the response.
+
+This issue affects Apache ZooKeeper from 3.7.0 through 3.9.6. Users are recommended to upgrade to version 3.9.7, which enforces configurable limits on the multiRead operation count and cumulative response size.
+
+**References:** https://www.cve.org/CVERecord?id=CVE-2026-100302
+
+---
+
+### CVE-2026-100300
+
+**Unauthenticated persistent denial of service via unvalidated quota-node data and paths crashing the transaction-apply thread**
+
+**Severity:** important
+CVSS 4.0: 8.7 (high) CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:N/VI:N/VA:H/SC:N/SI:N/SA:N
+
+**Affected versions:**
+
+- Apache ZooKeeper 3.9.0 through 3.9.6
+- Apache ZooKeeper 3.8.0 through 3.8.7
+
+**Description:**
+
+Improper handling of exceptional conditions in the quota subsystem of Apache ZooKeeper allows an attacker able to write
+under the /zookeeper/quota subtree — unauthenticated on default deployments, where that subtree is world-writable — to
+crash the server's critical request-processing thread and render the on-disk data directory permanently unbootable.
+
+This issue affects Apache ZooKeeper up to and including 3.9.6. Users are recommended to upgrade to version 3.8.8 or 3.9.7,
+which fixes the issue.
+
+**Credit:** cunyi li <xiaoheihei1107@gmail.com> (reporter)
+
+**References:** https://www.cve.org/CVERecord?id=CVE-2026-100300
+
+---
+
+### CVE-2026-100252
+
+**SASL authorization bypass on the client port through a client-supplied authorization ID**
+
+**Severity:** important
+CVSS 4.0: 8.6 (high) CVSS:4.0/AV:N/AC:L/AT:N/PR:L/UI:N/VC:H/VI:H/VA:N/SC:N/SI:N/SA:N
+
+**Affected versions:**
+
+- Apache ZooKeeper 3.9.0 through 3.9.6
+- Apache ZooKeeper 3.8.0 through 3.8.7
+
+**Description:**
+
+Improper Authorization vulnerability in Apache ZooKeeper.
+
+When SASL authentication is enabled on the client port, the server's SASL callback handler grants every authorization
+identity (authzid) that a client requests, without checking it against the principal the client authenticated as. The
+server then tries to replace the requested identity with a canonical form of the authenticated principal, derived from
+the zookeeper.security.auth_to_local rules. If no rule applies to the principal, canonicalization fails and the error is
+only logged. The client-requested authzid then becomes the session's SASL identity for all ACL checks.
+
+An authenticated client whose principal is not covered by the auth_to_local rules can therefore claim any SASL identity.
+With the default rules, this includes any Kerberos principal from a realm other than the server's default realm, such as
+a principal from a cross-realm trusted realm. The client then gets the permissions granted to that identity in sasl ACLs.
+If the requested identity matches a configured zookeeper.superUser, it gets superuser access to the whole data tree.
+
+Users are recommended to upgrade to version 3.8.8 or 3.9.7, which fixes the issue.
+
+**Credit:**
+
+- cunyi li <xiaoheihei1107@gmail.com> (reporter)
+- Prasath Jayasundar & PayPal Cyber Security Team (reporter)
+
+**References:** https://www.cve.org/CVERecord?id=CVE-2026-100252
+
+---
+
+### CVE-2026-100235
+
+**ACL enforcement bypass allows unauthorized operations to commit after an ACL revocation**
+
+**Severity:** moderate
+CVSS 4.0: 6.0 (medium) CVSS:4.0/AV:N/AC:L/AT:P/PR:L/UI:N/VC:N/VI:H/VA:N/SC:N/SI:N/SA:N
+
+**Affected versions:**
+
+- Apache ZooKeeper 3.9.0 through 3.9.6
+- Apache ZooKeeper 3.8.0 through 3.8.7
+
+**Description:**
+
+Incorrect authorization due to a time-of-check to time-of-use (TOCTOU) race condition in the setACL request handling of
+Apache ZooKeeper.
+
+When a node's ACL is changed via setACL, the pending change is not published to the server's outstanding change record
+for that node. Any request that is prepared (and authorized) after the setACL is submitted but before it commits is therefore
+checked against the previous, pre-revocation ACL, yet is applied to the data tree after the ACL change has taken effect.
+A client that currently holds a permission can use this window to perform operations requiring that permission through
+and after its revocation — for example, committing writes or deletes after losing write access, or re-granting itself full
+permissions, which persistently defeats the revocation. In deployments transitioning from the default OPEN_ACL_UNSAFE ACL
+to a restrictive ACL, any unauthenticated client can exploit this during the transition.
+
+This issue affects Apache ZooKeeper up to and including 3.9.6. Users are recommended to upgrade to version 3.8.8 or 3.9.7,
+which fixes the issue.
+
+**Credit:** cunyi li <xiaoheihei1107@gmail.com> (reporter)
+
+**References:** https://www.cve.org/CVERecord?id=CVE-2026-100235
+
+---
+
+### CVE-2026-84501
+
+**Operational log forgery via newline injection in EnsembleAuthenticationProvider**
+
+**Severity:** moderate
+
+**Affected versions:**
+
+- Apache ZooKeeper (org.apache.zookeeper:zookeeper) 3.9.0 through 3.9.5
+- Apache ZooKeeper (org.apache.zookeeper:zookeeper) 3.8.0 through 3.8.6
+
+**Description:**
+
+An unauthenticated attacker can inject arbitrary fake log lines into Apache ZooKeeper's operational log by sending a crafted add_auth("ensemble", ...) request containing newline characters (\n). When the ensemble name doesn't match, EnsembleAuthenticationProvider.handleAuthentication() logs the raw, unsanitized name via LOG.warn(). Because SLF4J's {} placeholder preserves embedded newlines, the attacker can forge complete log entries — with arbitrary timestamps, log levels, class names, and messages — that are visually indistinguishable from genuine ZooKeeper log output.
+
+Users are recommended to upgrade to version 3.8.7 or 3.9.6, which fixes the issue.
+
+**Credit:** Youlong Chen Institute of Computing Technology <chenyoulong20g@ict.ac.cn> (finder)
+
+**References:** https://www.cve.org/CVERecord?id=CVE-2026-84501
+
+---
+
+### CVE-2026-84439
+
+**Audit log injection via unsanitized output from multiple sources**
+
+**Severity:** important
+
+**Affected versions:**
+
+- Apache ZooKeeper (org.apache.zookeeper:zookeeper) 3.9.0 through 3.9.5
+- Apache ZooKeeper (org.apache.zookeeper:zookeeper) 3.8.0 through 3.8.6
+
+**Description:**
+
+When audit logging is enabled (zookeeper.audit.enable=true), an unauthenticated attacker can inject arbitrary fields into Apache ZooKeeper's audit log by sending a digest authentication request with tab characters (\t) embedded in the username. Because the audit log uses tab-separated key=value format, the injected tabs are parsed as legitimate field separators, allowing the attacker to spoof audit results (e.g., injecting result=success), forge operation types, and corrupt forensic evidence.
+
+A log injection vulnerability in Apache ZooKeeper allows a client that can call setACL to inject forged key-value fields into zookeeper_audit.log. When audit logging is enabled, the server serializes attacker-controlled digest ACL ids into the acl= audit field without escaping tab characters. Because audit events are emitted as tab-separated key=value records, a crafted ACL id can make one successful setAcl event appear to contain forged fields such as operation=delete and znode=/forged. This undermines the integrity of downstream audit parsing, alerting, and incident response.
+
+Users are recommended to upgrade to version 3.9.6 or 3.8.7, which fixes the issue.
+
+**Credit:** Youlong Chen Institute of Computing Technology <chenyoulong20g@ict.ac.cn> (reporter)
+
+**References:** https://www.cve.org/CVERecord?id=CVE-2026-84439
+
+---
+
+### CVE-2026-79993
+
+**Missing ACL check on deleteContainer opcode allows unauthorized deletion of any empty persistent/container znode**
+
+**Severity:** critical
+
+**Affected versions:**
+
+- Apache ZooKeeper (org.apache.zookeeper:zookeeper) 3.9.0 through 3.9.5
+- Apache ZooKeeper (org.apache.zookeeper:zookeeper) 3.8.0 through 3.8.6
+
+**Description:**
+
+The `deleteContainer` opcode (0x14/20) is processed without verifying the caller's ACL permissions, allowing any authenticated client to delete specific znodes in the data tree regardless of the ACL restrictions on the znode or its parent. This opcode is considered internal-only and the official client doesn't have API for it, but a client that can open a plain TCP session on the ZooKeeper client port (2181 by default) - with NO authentication and NO ACL permissions - can delete any empty persistent znode (including regular persistent nodes, container nodes, and TTL nodes) by issuing the raw protocol OpCode deleteContainer (20). The deleteContainer request path completely skips both the session check and the DELETE ACL check that are enforced by the regular delete (OpCode 2) path. This is an authorization bypass / ACL enforcement bug.
+
+Users are recommended to upgrade to version 3.9.6 or 3.8.7, which fixes the issue.
+
+**Credit:** K <sec-reports@outlook.com> (reporter), z f <tinkerzf@gmail.com> (reporter), 布豪 <1958304602@qq.com> (finder)
+
+**References:** https://www.cve.org/CVERecord?id=CVE-2026-79993
+
+---
+
+### CVE-2026-59969
+
+**Improper validation of certificate with host mismatch in FIPS mode**
+
+**Severity:** important
+
+**Affected versions:**
+
+- Apache ZooKeeper (org.apache.zookeeper:zookeeper) 3.9.0 through 3.9.5
+- Apache ZooKeeper (org.apache.zookeeper:zookeeper) 3.8.0 through 3.8.6
+
+**Description:**
+
+Apache ZooKeeper quorum TLS fails to enforce peer hostname verification in FIPS-mode deployments. When sslQuorum=true, zookeeper.fips-mode=true, ssl.quorum.hostnameVerification=true, and ssl.quorum.clientHostnameVerification=true are enabled, the Java SSLSocket quorum path accepts a CA-trusted peer certificate whose SAN does not match the connected host. A malicious or misissued peer certificate can therefore join quorum traffic, participate in leader election, and enter replication flows.
+
+Users are recommended to upgrade to version 3.8.7 or 3.9.6, which fixes the issue.
+
+**Credit:** Erichen <chenyoulong20g@ict.ac.cn> (reporter)
+
+**References:** https://www.cve.org/CVERecord?id=CVE-2026-59969
+
+---
+
+### CVE-2026-59739
+
+**Information disclosure via SetWatches reconnect replay**
+
+**Severity:** critical
+
+**Affected versions:**
+
+- Apache ZooKeeper (org.apache.zookeeper:zookeeper) 3.9.0 through 3.9.5
+- Apache ZooKeeper (org.apache.zookeeper:zookeeper) 3.8.0 through 3.8.6
+
+**Description:**
+
+Information disclosure via SetWatches reconnect replay in Apache ZooKeeper due to missing ACL check. An attacker can discover ACL-restricted paths by registering exists-watches on non-existent paths, then reconnecting after the paths are created with restricted ACLs. Issue is caused by incomplete fix for CVE-2024-23944 (ZOOKEEPER-4799). The fix added ACL checking to WatchManager.triggerWatch(). However, DataTree.setWatches() — the SetWatches/SetWatches2 reconnect replay handler — still calls watcher.process(event) with null ACL, bypassing the check entirely. It's important to note that only the path is exposed by this vulnerability, not the data of znode, but since znode path can contain sensitive information like user name or login ID, this issue is potentially critical.
+
+Users are recommended to upgrade to version 3.9.6, 3.8.7 which fixes the issue.
+
+**Credit:** NGUYEN HONG QUAN <hongquanvp11@gmail.com> (reporter), n0mi1k <nomilksec@gmail.com> (reporter)
+
+**References:** https://www.cve.org/CVERecord?id=CVE-2026-59739
+
+---
+
+### CVE-2026-24308
+
+**Sensitive information disclosure in client configuration handling**
+
+**Severity:** important
+
+**Affected versions:**
+
+- Apache ZooKeeper (org.apache.zookeeper:zookeeper) 3.9.0 through 3.9.4
+- Apache ZooKeeper (org.apache.zookeeper:zookeeper) 3.8.0 through 3.8.5
+
+**Description:**
+
+Improper handling of configuration values in ZKConfig in Apache ZooKeeper 3.8.5 and 3.9.4 on all platforms allows an attacker to expose sensitive information stored in client configuration in the client's logfile. Configuration values are exposed at INFO level logging rendering potential production systems affected by the issue. Users are recommended to upgrade to version 3.8.6 or 3.9.5 which fixes this issue.
+
+**Credit:** Youlong Chen (reporter)
+
+**References:** [https://www.cve.org/CVERecord?id=CVE-2026-24308](https://www.cve.org/CVERecord?id=CVE-2026-24308)
+
+---
+
+### CVE-2026-24281
+
+**Reverse-DNS fallback enables hostname verification bypass in ZooKeeper ZKTrustManager**
+
+**Severity:** important
+
+**Affected versions:**
+
+- Apache ZooKeeper (org.apache.zookeeper:zookeeper) 3.9.0 through 3.9.4
+- Apache ZooKeeper (org.apache.zookeeper:zookeeper) 3.8.0 through 3.8.5
+
+**Description:**
+
+Hostname verification in Apache ZooKeeper ZKTrustManager falls back to reverse DNS (PTR) when IP SAN validation fails, allowing attackers who control or spoof PTR records to impersonate ZooKeeper servers or clients with a valid certificate for the PTR name. It's important to note that attacker must present a certificate which is trusted by ZKTrustManager which makes the attack vector harder to exploit. Users are recommended to upgrade to version 3.8.6 or 3.9.5, which fixes this issue by introducing a new configuration option to disable reverse DNS lookup in client and quorum protocols.
+
+This issue is being tracked as [ZOOKEEPER-4986](https://issues.apache.org/jira/browse/ZOOKEEPER-4986).
+
+**Credit:** Nikita Markevich (reporter)
+
+**References:** [https://www.cve.org/CVERecord?id=CVE-2026-24281](https://www.cve.org/CVERecord?id=CVE-2026-24281) · [ZOOKEEPER-4986](https://issues.apache.org/jira/browse/ZOOKEEPER-4986)
+
+---
+
+### CVE-2025-58457
+
+**Insufficient Permission Check in AdminServer Snapshot/Restore Commands**
+
+**Severity:** moderate
+
+**Affected versions:**
+
+- Apache ZooKeeper (org.apache.zookeeper:zookeeper) 3.9.0 before 3.9.4
+
+**Description:**
+
+Improper permission check in ZooKeeper AdminServer lets authorized clients to run `snapshot` and `restore` command with insufficient permissions.
+
+This issue affects Apache ZooKeeper: from 3.9.0 before 3.9.4. Users are recommended to upgrade to version 3.9.4, which fixes the issue.
+
+The issue can be mitigated by disabling both commands (via `admin.snapshot.enabled` and `admin.restore.enabled`), disabling the whole AdminServer interface (via `admin.enableServer`), or ensuring that the root ACL does not provide open permissions. (Note that ZooKeeper ACLs are not recursive, so this does not impact operations on child nodes besides notifications from recursive watches.)
+
+**Credit:** Damien Diederen (reporter)
+
+**References:** [https://www.cve.org/CVERecord?id=CVE-2025-58457](https://www.cve.org/CVERecord?id=CVE-2025-58457)
+
+---
+
+### CVE-2024-51504
+
+**Authentication bypass with IP-based authentication in Admin Server**
+
+**Severity:** important
+
+**Affected versions:**
+
+- Apache ZooKeeper 3.9.0 before 3.9.3
+
+**Description:**
+
+When using IPAuthenticationProvider in ZooKeeper Admin Server there is a possibility of Authentication Bypass by Spoofing — this only impacts IP based authentication implemented in ZooKeeper Admin Server. Default configuration of client's IP address detection in IPAuthenticationProvider, which uses HTTP request headers, is weak and allows an attacker to bypass authentication via spoofing client's IP address in request headers. Default configuration honors `X-Forwarded-For` HTTP header to read client's IP address. `X-Forwarded-For` request header is mainly used by proxy servers to identify the client and can be easily spoofed by an attacker pretending that the request comes from a different IP address. Admin Server commands, such as snapshot and restore arbitrarily can be executed on successful exploitation which could potentially lead to information leakage or service availability issues. Users are recommended to upgrade to version 3.9.3, which fixes this issue.
+
+**Credit:** 4ra1n (reporter), Y4tacker (reporter)
+
+**References:** [https://www.cve.org/CVERecord?id=CVE-2024-51504](https://www.cve.org/CVERecord?id=CVE-2024-51504)
+
+---
+
+### CVE-2024-23944
+
+**Information disclosure in persistent watcher handling**
+
+**Severity:** critical
+
+**Affected versions:**
+
+- Apache ZooKeeper 3.9.0 through 3.9.1
+- Apache ZooKeeper 3.8.0 through 3.8.3
+- Apache ZooKeeper 3.6.0 through 3.7.2
+
+**Description:**
+
+Information disclosure in persistent watchers handling in Apache ZooKeeper due to missing ACL check. It allows an attacker to monitor child znodes by attaching a persistent watcher (`addWatch` command) to a parent which the attacker has already access to. ZooKeeper server doesn't do ACL check when the persistent watcher is triggered and as a consequence, the full path of znodes that a watch event gets triggered upon is exposed to the owner of the watcher. It's important to note that only the path is exposed by this vulnerability, not the data of znode, but since znode path can contain sensitive information like user name or login ID, this issue is potentially critical.
+
+Users are recommended to upgrade to version 3.9.2 or 3.8.4 which fixes the issue.
+
+**Credit:** 周吉安(寒泉) (reporter)
+
+**References:** [https://www.cve.org/CVERecord?id=CVE-2024-23944](https://www.cve.org/CVERecord?id=CVE-2024-23944)
+
+---
+
+### CVE-2023-44981
+
+**Authorization bypass in SASL Quorum Peer Authentication**
+
+**Severity:** critical
+
+**Affected versions:**
+
+- Apache ZooKeeper 3.9.0
+- Apache ZooKeeper 3.8.0 through 3.8.2
+- Apache ZooKeeper 3.7.0 through 3.7.1
+- Apache ZooKeeper before 3.7.0
+
+**Description:**
+
+Authorization Bypass Through User-Controlled Key vulnerability in Apache ZooKeeper. If SASL Quorum Peer authentication is enabled in ZooKeeper (`quorum.auth.enableSasl=true`), the authorization is done by verifying that the instance part in SASL authentication ID is listed in `zoo.cfg` server list. The instance part in SASL auth ID is optional and if it's missing, like `eve@EXAMPLE.COM`, the authorization check will be skipped. As a result an arbitrary endpoint could join the cluster and begin propagating counterfeit changes to the leader, essentially giving it complete read-write access to the data tree. Quorum Peer authentication is not enabled by default.
+
+Users are recommended to upgrade to version 3.9.1, 3.8.3, or 3.7.2, which fixes the issue.
+
+Alternately ensure the ensemble election/quorum communication is protected by a firewall as this will mitigate the issue.
+
+See the documentation for more details on correct cluster administration.
+
+**Credit:** Damien Diederen (reporter)
+
+**References:** [https://www.cve.org/CVERecord?id=CVE-2023-44981](https://www.cve.org/CVERecord?id=CVE-2023-44981)
+
+---
+
+### CVE-2019-0201
+
+**Information disclosure vulnerability in Apache ZooKeeper**
+
+**Severity:** Critical
+
+**Vendor:** The Apache Software Foundation
+
+**Versions Affected:** ZooKeeper prior to 3.4.14; ZooKeeper 3.5.0-alpha through 3.5.4-beta. The unsupported ZooKeeper 1.x through 3.3.x versions may be also affected.
+
+**Description:** ZooKeeper's `getACL()` command doesn't check any permission when retrieves the ACLs of the requested node and returns all information contained in the ACL Id field as plaintext string. DigestAuthenticationProvider overloads the Id field with the hash value that is used for user authentication. As a consequence, if Digest Authentication is in use, the unsalted hash value will be disclosed by `getACL()` request for unauthenticated or unprivileged users.
+
+**Mitigation:** Use an authentication method other than Digest (e.g. Kerberos) or upgrade to 3.4.14 or later (3.5.5 or later if on the 3.5 branch).
+
+**Credit:** This issue was identified by Harrison Neal, PatchAdvisor, Inc.
+
+**References:** [https://issues.apache.org/jira/browse/ZOOKEEPER-1392](https://issues.apache.org/jira/browse/ZOOKEEPER-1392)
+
+---
+
+### CVE-2018-8012
+
+**Apache ZooKeeper Quorum Peer mutual authentication**
+
+**Severity:** Critical
+
+**Vendor:** The Apache Software Foundation
+
+**Versions Affected:** ZooKeeper prior to 3.4.10; ZooKeeper 3.5.0-alpha through 3.5.3-beta. The unsupported ZooKeeper 1.x through 3.3.x versions may be also affected.
+
+**Description:** No authentication/authorization is enforced when a server attempts to join a quorum. As a result an arbitrary end point could join the cluster and begin propagating counterfeit changes to the leader.
+
+**Mitigation:** Upgrade to 3.4.10 or later (3.5.4-beta or later if on the 3.5 branch) and enable Quorum Peer mutual authentication.
+
+Alternately ensure the ensemble election/quorum communication is protected by a firewall as this will mitigate the issue.
+
+See the documentation for more details on correct cluster administration.
+
+**Credit:** This issue was identified by Földi Tamás and Eugene Koontz.
+
+**References:** [ZOOKEEPER-1045](https://issues.apache.org/jira/browse/ZOOKEEPER-1045) · [Server-Server mutual authentication](https://cwiki.apache.org/confluence/display/ZOOKEEPER/Server-Server+mutual+authentication) · [ZooKeeper Admin Guide](https://zookeeper.apache.org/doc/current/admin-ops/administrators-guide/)
+
+---
+
+### CVE-2017-5637
+
+**DOS attack on wchp/wchc four letter words (4lw)**
+
+**Severity:** moderate
+
+**Vendor:** The Apache Software Foundation
+
+**Versions Affected:** ZooKeeper 3.4.0 to 3.4.9; ZooKeeper 3.5.0 to 3.5.2. The unsupported ZooKeeper 1.x through 3.3.x versions may be also affected. Note: The 3.5 branch was still beta at this time.
+
+**Description:** Two four letter word commands "wchp/wchc" are CPU intensive and could cause spike of CPU utilization on ZooKeeper server if abused, which leads to the server unable to serve legitimate client requests. There is no known compromise which takes advantage of this vulnerability.
+
+**Mitigation:** This affects ZooKeeper ensembles whose client port is publicly accessible, so it is recommended to protect ZooKeeper ensemble with firewall. Documentation has also been updated to clarify on this point. In addition, a patch ([ZOOKEEPER-2693](https://issues.apache.org/jira/browse/ZOOKEEPER-2693)) is provided to disable "wchp/wchc" commands by default.
+
+- ZooKeeper 3.4.x users should upgrade to 3.4.10 or apply the patch.
+- ZooKeeper 3.5.x users should upgrade to 3.5.3 or apply the patch.
+
+**References:** [ZOOKEEPER-2693](https://issues.apache.org/jira/browse/ZOOKEEPER-2693)
+
+---
+
+### CVE-2016-5017
+
+**Buffer overflow vulnerability in ZooKeeper C cli shell**
+
+**Severity:** moderate
+
+**Vendor:** The Apache Software Foundation
+
+**Versions Affected:** ZooKeeper 3.4.0 to 3.4.8; ZooKeeper 3.5.0 to 3.5.2. The unsupported ZooKeeper 1.x through 3.3.x versions may be also affected. Note: The 3.5 branch was still alpha at this time.
+
+**Description:** The ZooKeeper C client shells "cli_st" and "cli_mt" have a buffer overflow vulnerability associated with parsing of the input command when using the `cmd:<cmd>` batch mode syntax. If the command string exceeds 1024 characters a buffer overflow will occur. There is no known compromise which takes advantage of this vulnerability, and if security is enabled the attacker would be limited by client level security constraints. The C cli shell is intended as a sample/example of how to use the C client interface, not as a production tool — the documentation has also been clarified on this point.
+
+**Mitigation:** It is important to use the fully featured/supported Java cli shell rather than the C cli shell independent of version.
+
+- ZooKeeper 3.4.x users should upgrade to 3.4.9 or apply this [patch](https://gitbox.apache.org/repos/asf?p=zookeeper.git;a=commitdiff;h=27ecf981a15554dc8e64a28630af7a5c9e2bdf4f).
+- ZooKeeper 3.5.x users should upgrade to 3.5.3 when released or apply this [patch](https://gitbox.apache.org/repos/asf?p=zookeeper.git;a=commitdiff;h=f09154d6648eeb4ec5e1ac8a2bacbd2f8c87c14a).
+
+The patch solves the problem reported here, but it does not make the client ready for production use. The community has no plan to make this client production ready at this time, and strongly recommends that users move to the Java cli and use the C cli for illustration purposes only.
+
+**Credit:** This issue was discovered by Lyon Yang (@l0Op3r).

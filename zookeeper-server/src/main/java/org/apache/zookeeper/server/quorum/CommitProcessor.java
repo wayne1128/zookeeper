@@ -90,7 +90,7 @@ public class CommitProcessor extends ZooKeeperCriticalThread implements RequestP
     /**
      * Incoming requests.
      */
-    protected LinkedBlockingQueue<Request> queuedRequests = new LinkedBlockingQueue<Request>();
+    protected LinkedBlockingQueue<Request> queuedRequests = new LinkedBlockingQueue<>();
 
     /**
      * Incoming requests that are waiting on a commit,
@@ -111,7 +111,7 @@ public class CommitProcessor extends ZooKeeperCriticalThread implements RequestP
     /**
      * Requests that have been committed.
      */
-    protected final LinkedBlockingQueue<Request> committedRequests = new LinkedBlockingQueue<Request>();
+    protected final LinkedBlockingQueue<Request> committedRequests = new LinkedBlockingQueue<>();
 
     /**
      * Requests that we are holding until commit comes in. Keys represent
@@ -213,12 +213,11 @@ public class CommitProcessor extends ZooKeeperCriticalThread implements RequestP
                  * request from a client on another server (i.e., the order of
                  * the following two lines is important!).
                  */
-                commitIsWaiting = !committedRequests.isEmpty();
-                requestsToProcess = queuedRequests.size();
-                // Avoid sync if we have something to do
-                if (requestsToProcess == 0 && !commitIsWaiting) {
-                    // Waiting for requests to process
-                    synchronized (this) {
+                synchronized (this) {
+                    commitIsWaiting = !committedRequests.isEmpty();
+                    requestsToProcess = queuedRequests.size();
+                    if (requestsToProcess == 0 && !commitIsWaiting) {
+                        // Waiting for requests to process
                         while (!stopped && requestsToProcess == 0 && !commitIsWaiting) {
                             wait();
                             commitIsWaiting = !committedRequests.isEmpty();

@@ -31,9 +31,14 @@ import java.security.KeyManagementException;
 import java.security.KeyStore;
 import java.security.NoSuchAlgorithmException;
 import java.security.Security;
+import java.security.cert.CertPathValidator;
 import java.security.cert.PKIXBuilderParameters;
+import java.security.cert.PKIXRevocationChecker;
 import java.security.cert.X509CertSelector;
-import java.util.Objects;
+import java.util.Arrays;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
 import javax.net.ssl.CertPathTrustManagerParameters;
@@ -50,22 +55,24 @@ import javax.net.ssl.X509TrustManager;
 import org.apache.zookeeper.common.X509Exception.KeyManagerException;
 import org.apache.zookeeper.common.X509Exception.SSLContextException;
 import org.apache.zookeeper.common.X509Exception.TrustManagerException;
+import org.apache.zookeeper.server.auth.ProviderRegistry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
  * Utility code for X509 handling
- *
- * Default cipher suites:
- *
- *   Performance testing done by Facebook engineers shows that on Intel x86_64 machines, Java9 performs better with
- *   GCM and Java8 performs better with CBC, so these seem like reasonable defaults.
  */
 public abstract class X509Util implements Closeable, AutoCloseable {
 
     private static final Logger LOG = LoggerFactory.getLogger(X509Util.class);
 
     private static final String REJECT_CLIENT_RENEGOTIATION_PROPERTY = "jdk.tls.rejectClientInitiatedRenegotiation";
+    public static final String FIPS_MODE_PROPERTY = "zookeeper.fips-mode";
+    public static final String CLIENT_CERT_RELOAD_KEY = "zookeeper.client.certReload";
+    private static final boolean FIPS_MODE_DEFAULT = true;
+    public static final String TLS_1_1 = "TLSv1.1";
+    public static final String TLS_1_2 = "TLSv1.2";
+    public static final String TLS_1_3 = "TLSv1.3";
 
     static {
         // Client-initiated renegotiation in TLS is unsafe and
@@ -79,27 +86,39 @@ public abstract class X509Util implements Closeable, AutoCloseable {
         }
     }
 
-    public static final String DEFAULT_PROTOCOL = "TLSv1.2";
-    private static String[] getGCMCiphers() {
-        return new String[]{"TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256", "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256", "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384", "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384"};
-    }
+    private static final AtomicReference<String> defaultProtocol = new AtomicReference<>();
 
-    private static String[] getCBCCiphers() {
-        return new String[]{"TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256", "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256", "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA", "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA", "TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA384", "TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA384", "TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA", "TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA"};
-    }
+    /**
+     * Return TLSv1.2 when FIPS mode is enabled.
+     * Otherwise, returns TLSv1.3 or TLSv1.2 depending on Java runtime version being used.
+     * TLSv1.3 was first introduced in JDK11 and back-ported to OpenJDK 8u272.
+     */
+    public static String defaultTlsProtocol(ZKConfig config) {
+        if (getFipsMode(config)) {
+            return TLS_1_2;
+        }
 
-    private static String[] concatArrays(String[] left, String[] right) {
-        String[] result = new String[left.length + right.length];
-        System.arraycopy(left, 0, result, 0, left.length);
-        System.arraycopy(right, 0, result, left.length, right.length);
-        return result;
-    }
+        String proto = defaultProtocol.get();
+        if (proto != null) {
+            return proto;
+        }
 
-    // On Java 8, prefer CBC ciphers since AES-NI support is lacking and GCM is slower than CBC.
-    private static final String[] DEFAULT_CIPHERS_JAVA8 = concatArrays(getCBCCiphers(), getGCMCiphers());
-    // On Java 9 and later, prefer GCM ciphers due to improved AES-NI support.
-    // Note that this performance assumption might not hold true for architectures other than x86_64.
-    private static final String[] DEFAULT_CIPHERS_JAVA9 = concatArrays(getGCMCiphers(), getCBCCiphers());
+        proto = TLS_1_2;
+        try {
+            List<String> supported = Arrays.asList(SSLContext.getDefault().getSupportedSSLParameters().getProtocols());
+            if (supported.contains(TLS_1_3)) {
+                proto = TLS_1_3;
+            }
+            if (defaultProtocol.compareAndSet(null, proto)) {
+                LOG.info("Supported TLS protocols are {}, default TLS protocol is {}", supported, proto);
+            } else {
+                proto = defaultProtocol.get();
+            }
+        } catch (NoSuchAlgorithmException e) {
+            // Ignore.
+        }
+        return proto;
+    }
 
     public static final int DEFAULT_HANDSHAKE_DETECTION_TIMEOUT_MILLIS = 5000;
 
@@ -114,15 +133,9 @@ public abstract class X509Util implements Closeable, AutoCloseable {
      * If the config property is not set, the default value is NEED.
      */
     public enum ClientAuth {
-        NONE(io.netty.handler.ssl.ClientAuth.NONE),
-        WANT(io.netty.handler.ssl.ClientAuth.OPTIONAL),
-        NEED(io.netty.handler.ssl.ClientAuth.REQUIRE);
-
-        private final io.netty.handler.ssl.ClientAuth nettyAuth;
-
-        ClientAuth(io.netty.handler.ssl.ClientAuth nettyAuth) {
-            this.nettyAuth = nettyAuth;
-        }
+        NONE,
+        WANT,
+        NEED;
 
         /**
          * Converts a property value to a ClientAuth enum. If the input string is empty or null, returns
@@ -137,41 +150,48 @@ public abstract class X509Util implements Closeable, AutoCloseable {
             }
             return ClientAuth.valueOf(prop.toUpperCase());
         }
-
-        public io.netty.handler.ssl.ClientAuth toNettyClientAuth() {
-            return nettyAuth;
-        }
     }
 
-    private String sslProtocolProperty = getConfigPrefix() + "protocol";
-    private String sslEnabledProtocolsProperty = getConfigPrefix() + "enabledProtocols";
-    private String cipherSuitesProperty = getConfigPrefix() + "ciphersuites";
-    private String sslKeystoreLocationProperty = getConfigPrefix() + "keyStore.location";
-    private String sslKeystorePasswdProperty = getConfigPrefix() + "keyStore.password";
-    private String sslKeystoreTypeProperty = getConfigPrefix() + "keyStore.type";
-    private String sslTruststoreLocationProperty = getConfigPrefix() + "trustStore.location";
-    private String sslTruststorePasswdProperty = getConfigPrefix() + "trustStore.password";
-    private String sslTruststoreTypeProperty = getConfigPrefix() + "trustStore.type";
-    private String sslContextSupplierClassProperty = getConfigPrefix() + "context.supplier.class";
-    private String sslHostnameVerificationEnabledProperty = getConfigPrefix() + "hostnameVerification";
-    private String sslCrlEnabledProperty = getConfigPrefix() + "crl";
-    private String sslOcspEnabledProperty = getConfigPrefix() + "ocsp";
-    private String sslClientAuthProperty = getConfigPrefix() + "clientAuth";
-    private String sslHandshakeDetectionTimeoutMillisProperty = getConfigPrefix() + "handshakeDetectionTimeoutMillis";
+    private final String sslProtocolProperty = getConfigPrefix() + "protocol";
+    private final String sslEnabledProtocolsProperty = getConfigPrefix() + "enabledProtocols";
+    private final String cipherSuitesProperty = getConfigPrefix() + "ciphersuites";
+    private final String sslKeystoreLocationProperty = getConfigPrefix() + "keyStore.location";
+    private final String sslKeystorePasswdProperty = getConfigPrefix() + "keyStore.password";
+    private final String sslKeystorePasswdPathProperty = getConfigPrefix() + "keyStore.passwordPath";
+    private final String sslKeystoreTypeProperty = getConfigPrefix() + "keyStore.type";
+    private final String sslClientKeystoreLocationProperty = getConfigPrefix() + "client.keyStore.location";
+    private final String sslClientKeystorePasswdProperty = getConfigPrefix() + "client.keyStore.password";
+    private final String sslClientKeystorePasswdPathProperty = getConfigPrefix() + "client.keyStore.passwordPath";
+    private final String sslClientKeystoreTypeProperty = getConfigPrefix() + "client.keyStore.type";
+    private final String sslTruststoreLocationProperty = getConfigPrefix() + "trustStore.location";
+    private final String sslTruststorePasswdProperty = getConfigPrefix() + "trustStore.password";
+    private final String sslTruststorePasswdPathProperty = getConfigPrefix() + "trustStore.passwordPath";
+    private final String sslTruststoreTypeProperty = getConfigPrefix() + "trustStore.type";
+    private final String sslServerTruststoreLocationProperty = getConfigPrefix() + "server.trustStore.location";
+    private final String sslServerTruststorePasswdProperty = getConfigPrefix() + "server.trustStore.password";
+    private final String sslServerTruststorePasswdPathProperty = getConfigPrefix() + "server.trustStore.passwordPath";
+    private final String sslServerTruststoreTypeProperty = getConfigPrefix() + "server.trustStore.type";
+    private final String sslContextSupplierClassProperty = getConfigPrefix() + "context.supplier.class";
+    private final String sslHostnameVerificationEnabledProperty = getConfigPrefix() + "hostnameVerification";
+    private final String sslClientHostnameVerificationEnabledProperty = getConfigPrefix() + "clientHostnameVerification";
+    private final String sslAllowReverseDnsLookupProperty = getConfigPrefix() + "allowReverseDnsLookup";
+    private final String sslCrlEnabledProperty = getConfigPrefix() + "crl";
+    private final String sslOcspEnabledProperty = getConfigPrefix() + "ocsp";
+    private final String sslClientAuthProperty = getConfigPrefix() + "clientAuth";
+    private final String sslHandshakeDetectionTimeoutMillisProperty = getConfigPrefix() + "handshakeDetectionTimeoutMillis";
 
-    private ZKConfig zkConfig;
-    private AtomicReference<SSLContextAndOptions> defaultSSLContextAndOptions = new AtomicReference<>(null);
+    private final AtomicReference<SSLContextAndOptions> defaultSSLContextAndOptions = new AtomicReference<>(null);
 
     private FileChangeWatcher keyStoreFileWatcher;
+    private FileChangeWatcher clientKeyStoreFileWatcher;
     private FileChangeWatcher trustStoreFileWatcher;
+    private FileChangeWatcher serverTrustStoreFileWatcher;
 
     public X509Util() {
-        this(null);
-    }
-
-    public X509Util(ZKConfig zkConfig) {
-        this.zkConfig = zkConfig;
-        keyStoreFileWatcher = trustStoreFileWatcher = null;
+        keyStoreFileWatcher = null;
+        clientKeyStoreFileWatcher = null;
+        trustStoreFileWatcher = null;
+        serverTrustStoreFileWatcher = null;
     }
 
     protected abstract String getConfigPrefix();
@@ -202,8 +222,28 @@ public abstract class X509Util implements Closeable, AutoCloseable {
         return sslKeystorePasswdProperty;
     }
 
+    public String getSslKeystorePasswdPathProperty() {
+        return sslKeystorePasswdPathProperty;
+    }
+
     public String getSslKeystoreTypeProperty() {
         return sslKeystoreTypeProperty;
+    }
+
+    public String getSslClientKeystoreLocationProperty() {
+        return sslClientKeystoreLocationProperty;
+    }
+
+    public String getSslClientKeystorePasswdProperty() {
+        return sslClientKeystorePasswdProperty;
+    }
+
+    public String getSslClientKeystorePasswdPathProperty() {
+        return sslClientKeystorePasswdPathProperty;
+    }
+
+    public String getSslClientKeystoreTypeProperty() {
+        return sslClientKeystoreTypeProperty;
     }
 
     public String getSslTruststoreLocationProperty() {
@@ -214,8 +254,28 @@ public abstract class X509Util implements Closeable, AutoCloseable {
         return sslTruststorePasswdProperty;
     }
 
+    public String getSslTruststorePasswdPathProperty() {
+        return sslTruststorePasswdPathProperty;
+    }
+
     public String getSslTruststoreTypeProperty() {
         return sslTruststoreTypeProperty;
+    }
+
+    public String getSslServerTruststoreLocationProperty() {
+        return sslServerTruststoreLocationProperty;
+    }
+
+    public String getSslServerTruststorePasswdProperty() {
+        return sslServerTruststorePasswdProperty;
+    }
+
+    public String getSslServerTruststorePasswdPathProperty() {
+        return sslServerTruststorePasswdPathProperty;
+    }
+
+    public String getSslServerTruststoreTypeProperty() {
+        return sslServerTruststoreTypeProperty;
     }
 
     public String getSslContextSupplierClassProperty() {
@@ -224,6 +284,14 @@ public abstract class X509Util implements Closeable, AutoCloseable {
 
     public String getSslHostnameVerificationEnabledProperty() {
         return sslHostnameVerificationEnabledProperty;
+    }
+
+    public String getSslClientHostnameVerificationEnabledProperty() {
+        return sslClientHostnameVerificationEnabledProperty;
+    }
+
+    public String getSslAllowReverseDnsLookupProperty() {
+        return sslAllowReverseDnsLookupProperty;
     }
 
     public String getSslCrlEnabledProperty() {
@@ -248,12 +316,33 @@ public abstract class X509Util implements Closeable, AutoCloseable {
         return sslHandshakeDetectionTimeoutMillisProperty;
     }
 
+    public String getFipsModeProperty() {
+        return FIPS_MODE_PROPERTY;
+    }
+
+    public static boolean getFipsMode(ZKConfig config) {
+        return config.getBoolean(FIPS_MODE_PROPERTY, FIPS_MODE_DEFAULT);
+    }
+
+    public boolean isServerHostnameVerificationEnabled(ZKConfig config) {
+        return config.getBoolean(this.getSslHostnameVerificationEnabledProperty(), true);
+    }
+
+    public boolean isClientHostnameVerificationEnabled(ZKConfig config) {
+        return isServerHostnameVerificationEnabled(config)
+            && config.getBoolean(this.getSslClientHostnameVerificationEnabledProperty(), shouldVerifyClientHostname());
+    }
+
+    public boolean allowReverseDnsLookup(ZKConfig config) {
+        return config.getBoolean(this.getSslAllowReverseDnsLookupProperty(), false);
+    }
+
     public SSLContext getDefaultSSLContext() throws X509Exception.SSLContextException {
-        return getDefaultSSLContextAndOptions().getSSLContext();
+        return getDefaultSSLContextAndOptions().getClientSSLContext();
     }
 
     public SSLContext createSSLContext(ZKConfig config) throws SSLContextException {
-        return createSSLContextAndOptions(config).getSSLContext();
+        return createSSLContextAndOptions(config).getClientSSLContext();
     }
 
     public SSLContextAndOptions getDefaultSSLContextAndOptions() throws X509Exception.SSLContextException {
@@ -271,6 +360,10 @@ public abstract class X509Util implements Closeable, AutoCloseable {
     private void resetDefaultSSLContextAndOptions() throws X509Exception.SSLContextException {
         SSLContextAndOptions newContext = createSSLContextAndOptions();
         defaultSSLContextAndOptions.set(newContext);
+
+        if (Boolean.getBoolean(CLIENT_CERT_RELOAD_KEY)) {
+            ProviderRegistry.addOrUpdateProvider(ProviderRegistry.AUTHPROVIDER_PROPERTY_PREFIX + "x509");
+        }
     }
 
     private SSLContextAndOptions createSSLContextAndOptions() throws SSLContextException {
@@ -279,7 +372,7 @@ public abstract class X509Util implements Closeable, AutoCloseable {
          * configuration from system property. Reading property from
          * configuration will be same reading from system property
          */
-        return createSSLContextAndOptions(zkConfig == null ? new ZKConfig() : zkConfig);
+        return createSSLContextAndOptions(new ZKConfig());
     }
 
     /**
@@ -302,90 +395,135 @@ public abstract class X509Util implements Closeable, AutoCloseable {
         }
     }
 
-    @SuppressWarnings("unchecked")
     public SSLContextAndOptions createSSLContextAndOptions(ZKConfig config) throws SSLContextException {
-        final String supplierContextClassName = config.getProperty(sslContextSupplierClassProperty);
-        if (supplierContextClassName != null) {
-            LOG.debug("Loading SSLContext supplier from property '{}'", sslContextSupplierClassProperty);
+        final SSLContext suppliedSSLContext = loadSuppliedSSLContext(config);
+        if (suppliedSSLContext != null) {
+            return new SSLContextAndOptions(this, config, suppliedSSLContext);
+        }
+        return createSSLContextAndOptionsFromConfig(config);
+    }
 
-            try {
-                Class<?> sslContextClass = Class.forName(supplierContextClassName);
-                Supplier<SSLContext> sslContextSupplier = (Supplier<SSLContext>) sslContextClass.getConstructor().newInstance();
-                return new SSLContextAndOptions(this, config, sslContextSupplier.get());
-            } catch (ClassNotFoundException
-                | ClassCastException
-                | NoSuchMethodException
-                | InvocationTargetException
-                | InstantiationException
-                | IllegalAccessException e) {
-                throw new SSLContextException("Could not retrieve the SSLContext from supplier source '"
-                                              + supplierContextClassName
-                                              + "' provided in the property '"
-                                              + sslContextSupplierClassProperty
-                                              + "'", e);
-            }
-        } else {
-            return createSSLContextAndOptionsFromConfig(config);
+    /**
+     * Loads an {@link SSLContext} from the {@link Supplier} implementation named by the
+     * {@link #getSslContextSupplierClassProperty()} property. This allows a user to take full control over
+     * the construction of the SSLContext, for example to use a hardware key store or an SSLContext obtained
+     * from a container, rather than having ZooKeeper load key material from files.
+     *
+     * @param config the configuration to read the supplier class name from.
+     * @return the supplied SSLContext, or {@code null} if the property is not set.
+     * @throws SSLContextException if the supplier class cannot be loaded, instantiated or invoked.
+     */
+    @SuppressWarnings("unchecked")
+    protected SSLContext loadSuppliedSSLContext(ZKConfig config) throws SSLContextException {
+        final String supplierContextClassName = config.getProperty(sslContextSupplierClassProperty);
+        if (supplierContextClassName == null) {
+            return null;
+        }
+        LOG.debug("Loading SSLContext supplier from property '{}'", sslContextSupplierClassProperty);
+
+        try {
+            Class<?> sslContextClass = Class.forName(supplierContextClassName);
+            Supplier<SSLContext> sslContextSupplier = (Supplier<SSLContext>) sslContextClass.getConstructor().newInstance();
+            return sslContextSupplier.get();
+        } catch (ClassNotFoundException
+            | ClassCastException
+            | NoSuchMethodException
+            | InvocationTargetException
+            | InstantiationException
+            | IllegalAccessException e) {
+            throw new SSLContextException("Could not retrieve the SSLContext from supplier source '"
+                                          + supplierContextClassName
+                                          + "' provided in the property '"
+                                          + sslContextSupplierClassProperty
+                                          + "'", e);
         }
     }
 
     public SSLContextAndOptions createSSLContextAndOptionsFromConfig(ZKConfig config) throws SSLContextException {
-        KeyManager[] keyManagers = null;
-        TrustManager[] trustManagers = null;
-
-        String keyStoreLocationProp = config.getProperty(sslKeystoreLocationProperty, "");
-        String keyStorePasswordProp = config.getProperty(sslKeystorePasswdProperty, "");
-        String keyStoreTypeProp = config.getProperty(sslKeystoreTypeProperty);
-
         // There are legal states in some use cases for null KeyManager or TrustManager.
         // But if a user wanna specify one, location is required. Password defaults to empty string if it is not
         // specified by the user.
+        String defaultTlsProtocol = defaultTlsProtocol(config);
+        String protocol = config.getProperty(sslProtocolProperty, defaultTlsProtocol);
 
-        if (keyStoreLocationProp.isEmpty()) {
-            LOG.warn("{} not specified", getSslKeystoreLocationProperty());
-        } else {
-            try {
-                keyManagers = new KeyManager[]{createKeyManager(keyStoreLocationProp, keyStorePasswordProp, keyStoreTypeProp)};
-            } catch (KeyManagerException keyManagerException) {
-                throw new SSLContextException("Failed to create KeyManager", keyManagerException);
-            } catch (IllegalArgumentException e) {
-                throw new SSLContextException("Bad value for " + sslKeystoreTypeProperty + ": " + keyStoreTypeProp, e);
-            }
-        }
+        // Shared (common) key and trust managers — built once and reused as
+        // the fallback when no dedicated client/server stores are configured.
+        X509KeyManager sharedKeyManager;
+        X509TrustManager sharedTrustManager;
 
-        String trustStoreLocationProp = config.getProperty(sslTruststoreLocationProperty, "");
-        String trustStorePasswordProp = config.getProperty(sslTruststorePasswdProperty, "");
-        String trustStoreTypeProp = config.getProperty(sslTruststoreTypeProperty);
-
-        boolean sslCrlEnabled = config.getBoolean(this.sslCrlEnabledProperty);
-        boolean sslOcspEnabled = config.getBoolean(this.sslOcspEnabledProperty);
-        boolean sslServerHostnameVerificationEnabled = config.getBoolean(this.getSslHostnameVerificationEnabledProperty(), true);
-        boolean sslClientHostnameVerificationEnabled = sslServerHostnameVerificationEnabled && shouldVerifyClientHostname();
-
-        if (trustStoreLocationProp.isEmpty()) {
-            LOG.warn("{} not specified", getSslTruststoreLocationProperty());
-        } else {
-            try {
-                trustManagers = new TrustManager[]{createTrustManager(trustStoreLocationProp, trustStorePasswordProp, trustStoreTypeProp, sslCrlEnabled, sslOcspEnabled, sslServerHostnameVerificationEnabled, sslClientHostnameVerificationEnabled)};
-            } catch (TrustManagerException trustManagerException) {
-                throw new SSLContextException("Failed to create TrustManager", trustManagerException);
-            } catch (IllegalArgumentException e) {
-                throw new SSLContextException("Bad value for "
-                                              + sslTruststoreTypeProperty
-                                              + ": "
-                                              + trustStoreTypeProp, e);
-            }
-        }
-
-        String protocol = config.getProperty(sslProtocolProperty, DEFAULT_PROTOCOL);
         try {
-            SSLContext sslContext = SSLContext.getInstance(protocol);
-            sslContext.init(keyManagers, trustManagers, null);
-            return new SSLContextAndOptions(this, config, sslContext);
+            sharedKeyManager = buildKeyManager(config);
+        } catch (KeyManagerException keyManagerException) {
+            throw new SSLContextException("Failed to create KeyManager", keyManagerException);
+        } catch (IllegalArgumentException e) {
+            String keyStoreTypeProp = config.getProperty(sslKeystoreTypeProperty);
+            throw new SSLContextException("Bad value for " + sslKeystoreTypeProperty + ": " + keyStoreTypeProp, e);
+        }
+
+        try {
+            sharedTrustManager = buildTrustManager(config);
+        } catch (TrustManagerException trustManagerException) {
+            throw new SSLContextException("Failed to create TrustManager", trustManagerException);
+        } catch (IllegalArgumentException e) {
+            String trustStoreTypeProp = config.getProperty(sslTruststoreTypeProperty);
+            throw new SSLContextException("Bad value for "
+                    + sslTruststoreTypeProperty + ": " + trustStoreTypeProp, e);
+        }
+
+        // Client context - used for outgoing connections (client role)
+        KeyManager[] clientKeyManagers = null;
+        TrustManager[] clientTrustManagers = null;
+
+        try {
+            X509KeyManager clientKm = buildClientKeyManager(config, sharedKeyManager);
+            if (clientKm != null) {
+                clientKeyManagers = new KeyManager[]{clientKm};
+            }
+        } catch (KeyManagerException keyManagerException) {
+            throw new SSLContextException("Failed to create KeyManager", keyManagerException);
+        } catch (IllegalArgumentException e) {
+            String keyStoreTypeProp = config.getProperty(sslClientKeystoreTypeProperty);
+            throw new SSLContextException("Bad value for " + sslClientKeystoreTypeProperty + ": " + keyStoreTypeProp, e);
+        }
+
+        if (sharedTrustManager != null) {
+            clientTrustManagers = new TrustManager[]{sharedTrustManager};
+        }
+
+        // Server context - used for incoming connections (server role)
+        KeyManager[] serverKeyManagers = null;
+        TrustManager[] serverTrustManagers = null;
+
+        if (sharedKeyManager != null) {
+            serverKeyManagers = new KeyManager[]{sharedKeyManager};
+        }
+
+        try {
+            X509TrustManager serverTm = buildServerTrustManager(config, sharedTrustManager);
+            if (serverTm != null) {
+                serverTrustManagers = new TrustManager[]{serverTm};
+            }
+        } catch (TrustManagerException trustManagerException) {
+            throw new SSLContextException("Failed to create TrustManager", trustManagerException);
+        } catch (IllegalArgumentException e) {
+            String trustStoreTypeProp = config.getProperty(sslServerTruststoreTypeProperty);
+            throw new SSLContextException("Bad value for "
+                    + sslServerTruststoreTypeProperty + ": " + trustStoreTypeProp, e);
+        }
+
+        try {
+            SSLContext clientCtx = SSLContext.getInstance(protocol);
+            clientCtx.init(clientKeyManagers, clientTrustManagers, null);
+
+            SSLContext serverCtx = SSLContext.getInstance(protocol);
+            serverCtx.init(serverKeyManagers, serverTrustManagers, null);
+
+            return new SSLContextAndOptions(this, config, clientCtx, serverCtx);
         } catch (NoSuchAlgorithmException | KeyManagementException sslContextInitException) {
             throw new SSLContextException(sslContextInitException);
         }
     }
+
 
     public static KeyStore loadKeyStore(
         String keyStoreLocation,
@@ -414,14 +552,75 @@ public abstract class X509Util implements Closeable, AutoCloseable {
     }
 
     /**
+     * Returns the password specified by the given property or from the file specified by the given path property.
+     * If both are specified, the value stored in the file will be returned.
+     *
+     * @param config  Zookeeper configuration
+     * @param propertyName  property name
+     * @param pathPropertyName path property name
+     * @return the password value
+     */
+    public String getPasswordFromConfigPropertyOrFile(final ZKConfig config,
+                                                      final String propertyName,
+                                                      final String pathPropertyName) {
+        String value = config.getProperty(propertyName, "");
+        final String pathProperty = config.getProperty(pathPropertyName, "");
+        if (!pathProperty.isEmpty()) {
+            value = String.valueOf(SecretUtils.readSecret(pathProperty));
+        }
+        return value;
+    }
+
+    public X509KeyManager buildKeyManager(ZKConfig config) throws KeyManagerException {
+        String keyStoreLocation = config.getProperty(getSslKeystoreLocationProperty(), "");
+        if (keyStoreLocation.isEmpty()) {
+            LOG.warn("{} not specified for X509KeyManager", getSslKeystoreLocationProperty());
+            return null;
+        }
+        String keyStorePassword = getPasswordFromConfigPropertyOrFile(config, getSslKeystorePasswdProperty(),
+                getSslKeystorePasswdPathProperty());
+        String keyStoreType = config.getProperty(getSslKeystoreTypeProperty());
+        LOG.debug("Using SSL keystore {}", keyStoreLocation);
+        return createKeyManager(keyStoreLocation, keyStorePassword, keyStoreType);
+    }
+
+    /**
+     * Builds a key manager for the client role. If a dedicated client keystore
+     * is configured ({@code client.keyStore.location}), it is loaded and returned.
+     * Otherwise, falls back to the shared keystore via {@link #buildKeyManager(ZKConfig)}.
+     */
+    public X509KeyManager buildClientKeyManager(ZKConfig config) throws KeyManagerException {
+        return buildClientKeyManager(config, null);
+    }
+
+    /**
+     * Builds a key manager for the client role. If a dedicated client keystore
+     * is configured ({@code client.keyStore.location}), it is loaded and returned.
+     * Otherwise, returns the pre-built {@code sharedKeyManager} (or falls back
+     * to {@link #buildKeyManager(ZKConfig)} when {@code sharedKeyManager} is null).
+     */
+    public X509KeyManager buildClientKeyManager(ZKConfig config, X509KeyManager sharedKeyManager) throws KeyManagerException {
+        String clientKeyStoreLocation = config.getProperty(getSslClientKeystoreLocationProperty(), "");
+        if (!clientKeyStoreLocation.isEmpty()) {
+            String clientKeyStorePassword = getPasswordFromConfigPropertyOrFile(config,
+                    getSslClientKeystorePasswdProperty(), getSslClientKeystorePasswdPathProperty());
+            String clientKeyStoreType = config.getProperty(getSslClientKeystoreTypeProperty());
+            LOG.debug("Using SSL client keystore {}", clientKeyStoreLocation);
+            return createKeyManager(clientKeyStoreLocation, clientKeyStorePassword, clientKeyStoreType);
+        }
+        LOG.debug("{} not specified for X509KeyManager, falling back to common property", getSslClientKeystoreLocationProperty());
+        return sharedKeyManager != null ? sharedKeyManager : buildKeyManager(config);
+    }
+
+    /**
      * Creates a key manager by loading the key store from the given file of
      * the given type, optionally decrypting it using the given password.
      * @param keyStoreLocation the location of the key store file.
      * @param keyStorePassword optional password to decrypt the key store. If
      *                         empty, assumes the key store is not encrypted.
-     * @param keyStoreTypeProp must be JKS, PEM, or null. If null, attempts to
-     *                         autodetect the key store type from the file
-     *                         extension (.jks / .pem).
+     * @param keyStoreTypeProp must be JKS, PEM, PKCS12, BCFKS or null. If null,
+     *                         attempts to autodetect the key store type from
+     *                         the file extension (e.g. .jks / .pem).
      * @return the key manager.
      * @throws KeyManagerException if something goes wrong.
      */
@@ -448,19 +647,96 @@ public abstract class X509Util implements Closeable, AutoCloseable {
         }
     }
 
+    public X509TrustManager buildTrustManager(ZKConfig config) throws TrustManagerException {
+        String trustStoreLocationProp = config.getProperty(sslTruststoreLocationProperty, "");
+        if (trustStoreLocationProp.isEmpty()) {
+            LOG.warn("{} not specified for X509TrustManager", sslTruststoreLocationProperty);
+            return null;
+        }
+
+        LOG.debug("Using SSL trust store {}", trustStoreLocationProp);
+        return buildX509TrustManager(config, trustStoreLocationProp, sslTruststorePasswdProperty, sslTruststorePasswdPathProperty, sslTruststoreTypeProperty);
+    }
+
+    public X509TrustManager buildServerTrustManager(ZKConfig config) throws TrustManagerException {
+        return buildServerTrustManager(config, null);
+    }
+
+    public X509TrustManager buildServerTrustManager(ZKConfig config, X509TrustManager sharedTrustManager) throws TrustManagerException {
+        String serverTrustStoreLocation = config.getProperty(sslServerTruststoreLocationProperty, "");
+        if (serverTrustStoreLocation.isEmpty()) {
+            LOG.debug("{} not specified for X509TrustManager, falling back to common property", sslServerTruststoreLocationProperty);
+            return sharedTrustManager != null ? sharedTrustManager : buildTrustManager(config);
+        }
+        LOG.debug("Using SSL server trust store {}", serverTrustStoreLocation);
+        return buildX509TrustManager(config, serverTrustStoreLocation, sslServerTruststorePasswdProperty, sslServerTruststorePasswdPathProperty, sslServerTruststoreTypeProperty);
+    }
+
+    private X509TrustManager buildX509TrustManager(ZKConfig config, String trustStoreLocationProp,
+                                                   String sslTruststorePasswdProperty,
+                                                   String sslTruststorePasswdPathProperty,
+                                                   String sslTruststoreTypeProperty) throws TrustManagerException {
+        String trustStorePasswordProp = getPasswordFromConfigPropertyOrFile(config, sslTruststorePasswdProperty, sslTruststorePasswdPathProperty);
+        String trustStoreTypeProp = config.getProperty(sslTruststoreTypeProperty);
+
+        boolean sslCrlEnabled = config.getBoolean(this.sslCrlEnabledProperty, Boolean.getBoolean("com.sun.net.ssl.checkRevocation"));
+        boolean sslOcspEnabled = config.getBoolean(this.sslOcspEnabledProperty, Boolean.parseBoolean(Security.getProperty("ocsp.enable")));
+
+        boolean sslServerHostnameVerificationEnabled = isServerHostnameVerificationEnabled(config);
+        boolean sslClientHostnameVerificationEnabled = isClientHostnameVerificationEnabled(config);
+        boolean allowReverseDnsLookup = allowReverseDnsLookup(config);
+        boolean fipsMode = getFipsMode(config);
+
+        return createTrustManagerInternal(
+                trustStoreLocationProp,
+                trustStorePasswordProp,
+                trustStoreTypeProp,
+                sslCrlEnabled,
+                sslOcspEnabled,
+                sslServerHostnameVerificationEnabled,
+                sslClientHostnameVerificationEnabled,
+                allowReverseDnsLookup,
+                fipsMode);
+    }
+
+
+    // @VisibleForTesting
+    protected X509TrustManager createTrustManagerInternal(
+            String trustStoreLocation,
+            String trustStorePassword,
+            String trustStoreTypeProp,
+            boolean crlEnabled,
+            boolean ocspEnabled,
+            final boolean serverHostnameVerificationEnabled,
+            final boolean clientHostnameVerificationEnabled,
+            final boolean allowReverseDnsLookup,
+            final boolean fipsMode) throws TrustManagerException {
+        return createTrustManager(
+                trustStoreLocation,
+                trustStorePassword,
+                trustStoreTypeProp,
+                crlEnabled,
+                ocspEnabled,
+                serverHostnameVerificationEnabled,
+                clientHostnameVerificationEnabled,
+                allowReverseDnsLookup,
+                fipsMode);
+    }
+
     /**
      * Creates a trust manager by loading the trust store from the given file
      * of the given type, optionally decrypting it using the given password.
-     * @param trustStoreLocation the location of the trust store file.
-     * @param trustStorePassword optional password to decrypt the trust store
-     *                           (only applies to JKS trust stores). If empty,
-     *                           assumes the trust store is not encrypted.
-     * @param trustStoreTypeProp must be JKS, PEM, or null. If null, attempts
-     *                           to autodetect the trust store type from the
-     *                           file extension (.jks / .pem).
-     * @param crlEnabled enable CRL (certificate revocation list) checks.
-     * @param ocspEnabled enable OCSP (online certificate status protocol)
-     *                    checks.
+     *
+     * @param trustStoreLocation                the location of the trust store file.
+     * @param trustStorePassword                optional password to decrypt the trust store
+     *                                          (only applies to JKS trust stores). If empty,
+     *                                          assumes the trust store is not encrypted.
+     * @param trustStoreTypeProp                must be JKS, PEM, PKCS12, BCFKS or null. If
+     *                                          null, attempts to autodetect the trust store
+     *                                          type from the file extension (e.g. .jks / .pem).
+     * @param crlEnabled                        enable CRL (certificate revocation list) checks.
+     * @param ocspEnabled                       enable OCSP (online certificate status protocol)
+     *                                          checks.
      * @param serverHostnameVerificationEnabled if true, verify hostnames of
      *                                          remote servers that client
      *                                          sockets created by this
@@ -480,20 +756,46 @@ public abstract class X509Util implements Closeable, AutoCloseable {
         boolean crlEnabled,
         boolean ocspEnabled,
         final boolean serverHostnameVerificationEnabled,
-        final boolean clientHostnameVerificationEnabled) throws TrustManagerException {
+        final boolean clientHostnameVerificationEnabled,
+        final boolean allowReverseDnsLookup,
+        final boolean fipsMode) throws TrustManagerException {
         if (trustStorePassword == null) {
             trustStorePassword = "";
         }
         try {
             KeyStore ts = loadTrustStore(trustStoreLocation, trustStorePassword, trustStoreTypeProp);
             PKIXBuilderParameters pbParams = new PKIXBuilderParameters(ts, new X509CertSelector());
-            if (crlEnabled || ocspEnabled) {
-                pbParams.setRevocationEnabled(true);
-                System.setProperty("com.sun.net.ssl.checkRevocation", "true");
-                System.setProperty("com.sun.security.enableCRLDP", "true");
-                if (ocspEnabled) {
-                    Security.setProperty("ocsp.enable", "true");
+            if (crlEnabled) {
+                // See [RevocationChecker][1] for details. Basically, we are mimicking the legacy path,
+                // which relies significantly on jvm wide properties[2], as that is the path we are routing
+                // before (i.e. no explicit `PKIXRevocationChecker`).
+                //
+                // By reading but not writing these properties, we conform to but not interfere with what
+                // admin set while still keep backward compatibility.
+                // 1. Default "zookeeper.ssl.crl" to jvm property "com.sun.net.ssl.checkRevocation" if it is unset.
+                // 2. Default "zookeeper.ssl.ocsp" to jvm security property "ocsp.enable" if it is unset.
+                // 3. Set `Option.ONLY_END_ENTITY` for jvm security property "com.sun.security.onlyCheckRevocationOfEECert".
+                // 4. Don't set "com.sun.security.enableCRLDP" as it is always enabled in no legacy path.
+                //
+                // See also:
+                // * https://docs.oracle.com/javase/8/docs/technotes/guides/security/jsse/ocsp.html
+                // * https://docs.oracle.com/javase/8/docs/technotes/guides/security/jsse/JSSERefGuide.html
+                // * https://docs.oracle.com/javase/8/docs/technotes/guides/security/certpath/CertPathProgGuide.html#PKIXRevocationChecker
+                //
+                // [1]: https://github.com/openjdk/jdk/blob/jdk-11%2B28/src/java.base/share/classes/sun/security/provider/certpath/RevocationChecker.java#L124
+                // [2]: https://github.com/openjdk/jdk/blob/jdk-11%2B28/src/java.base/share/classes/sun/security/provider/certpath/RevocationChecker.java#L179
+                Set<PKIXRevocationChecker.Option> options = new HashSet<>();
+                if (!ocspEnabled) {
+                    options.add(PKIXRevocationChecker.Option.NO_FALLBACK);
+                    options.add(PKIXRevocationChecker.Option.PREFER_CRLS);
                 }
+                if (Boolean.parseBoolean(Security.getProperty("com.sun.security.onlyCheckRevocationOfEECert")))  {
+                    options.add(PKIXRevocationChecker.Option.ONLY_END_ENTITY);
+                }
+
+                PKIXRevocationChecker revocationChecker = (PKIXRevocationChecker) CertPathValidator.getInstance("PKIX").getRevocationChecker();
+                revocationChecker.setOptions(options);
+                pbParams.addCertPathChecker(revocationChecker);
             } else {
                 pbParams.setRevocationEnabled(false);
             }
@@ -504,7 +806,17 @@ public abstract class X509Util implements Closeable, AutoCloseable {
 
             for (final TrustManager tm : tmf.getTrustManagers()) {
                 if (tm instanceof X509ExtendedTrustManager) {
-                    return new ZKTrustManager((X509ExtendedTrustManager) tm, serverHostnameVerificationEnabled, clientHostnameVerificationEnabled);
+                    if (fipsMode) {
+                        if (LOG.isDebugEnabled()) {
+                            LOG.debug("FIPS mode is ON: selecting standard x509 trust manager {}", tm);
+                        }
+                        return (X509TrustManager) tm;
+                    }
+                    if (LOG.isDebugEnabled()) {
+                        LOG.debug("FIPS mode is OFF: creating ZKTrustManager");
+                    }
+                    return new ZKTrustManager((X509ExtendedTrustManager) tm, serverHostnameVerificationEnabled,
+                        clientHostnameVerificationEnabled, allowReverseDnsLookup);
                 }
             }
             throw new TrustManagerException("Couldn't find X509TrustManager");
@@ -529,26 +841,6 @@ public abstract class X509Util implements Closeable, AutoCloseable {
         return getDefaultSSLContextAndOptions().createSSLServerSocket(port);
     }
 
-    static String[] getDefaultCipherSuites() {
-        return getDefaultCipherSuitesForJavaVersion(System.getProperty("java.specification.version"));
-    }
-
-    static String[] getDefaultCipherSuitesForJavaVersion(String javaVersion) {
-        Objects.requireNonNull(javaVersion);
-        if (javaVersion.matches("\\d+")) {
-            // Must be Java 9 or later
-            LOG.debug("Using Java9+ optimized cipher suites for Java version {}", javaVersion);
-            return DEFAULT_CIPHERS_JAVA9;
-        } else if (javaVersion.startsWith("1.")) {
-            // Must be Java 1.8 or earlier
-            LOG.debug("Using Java8 optimized cipher suites for Java version {}", javaVersion);
-            return DEFAULT_CIPHERS_JAVA8;
-        } else {
-            LOG.debug("Could not parse java version {}, using Java8 optimized cipher suites", javaVersion);
-            return DEFAULT_CIPHERS_JAVA8;
-        }
-    }
-
     private FileChangeWatcher newFileChangeWatcher(String fileLocation) throws IOException {
         if (fileLocation == null || fileLocation.isEmpty()) {
             return null;
@@ -570,7 +862,7 @@ public abstract class X509Util implements Closeable, AutoCloseable {
      */
     public void enableCertFileReloading() throws IOException {
         LOG.info("enabling cert file reloading");
-        ZKConfig config = zkConfig == null ? new ZKConfig() : zkConfig;
+        ZKConfig config = new ZKConfig();
         FileChangeWatcher newKeyStoreFileWatcher = newFileChangeWatcher(config.getProperty(sslKeystoreLocationProperty));
         if (newKeyStoreFileWatcher != null) {
             // stop old watcher if there is one
@@ -579,6 +871,15 @@ public abstract class X509Util implements Closeable, AutoCloseable {
             }
             keyStoreFileWatcher = newKeyStoreFileWatcher;
             keyStoreFileWatcher.start();
+        }
+        FileChangeWatcher newClientKeyStoreFileWatcher = newFileChangeWatcher(config.getProperty(sslClientKeystoreLocationProperty));
+        if (newClientKeyStoreFileWatcher != null) {
+            // stop old watcher if there is one
+            if (clientKeyStoreFileWatcher != null) {
+                clientKeyStoreFileWatcher.stop();
+            }
+            clientKeyStoreFileWatcher = newClientKeyStoreFileWatcher;
+            clientKeyStoreFileWatcher.start();
         }
         FileChangeWatcher newTrustStoreFileWatcher = newFileChangeWatcher(config.getProperty(sslTruststoreLocationProperty));
         if (newTrustStoreFileWatcher != null) {
@@ -589,6 +890,15 @@ public abstract class X509Util implements Closeable, AutoCloseable {
             trustStoreFileWatcher = newTrustStoreFileWatcher;
             trustStoreFileWatcher.start();
         }
+        FileChangeWatcher newServerTrustStoreFileWatcher = newFileChangeWatcher(config.getProperty(sslServerTruststoreLocationProperty));
+        if (newServerTrustStoreFileWatcher != null) {
+            // stop old watcher if there is one
+            if (serverTrustStoreFileWatcher != null) {
+                serverTrustStoreFileWatcher.stop();
+            }
+            serverTrustStoreFileWatcher = newServerTrustStoreFileWatcher;
+            serverTrustStoreFileWatcher.start();
+        }
     }
 
     /**
@@ -597,13 +907,22 @@ public abstract class X509Util implements Closeable, AutoCloseable {
      */
     @Override
     public void close() {
+        defaultSSLContextAndOptions.set(null);
         if (keyStoreFileWatcher != null) {
             keyStoreFileWatcher.stop();
             keyStoreFileWatcher = null;
         }
+        if (clientKeyStoreFileWatcher != null) {
+            clientKeyStoreFileWatcher.stop();
+            clientKeyStoreFileWatcher = null;
+        }
         if (trustStoreFileWatcher != null) {
             trustStoreFileWatcher.stop();
             trustStoreFileWatcher = null;
+        }
+        if (serverTrustStoreFileWatcher != null) {
+            serverTrustStoreFileWatcher.stop();
+            serverTrustStoreFileWatcher = null;
         }
     }
 

@@ -19,15 +19,10 @@
 package org.apache.zookeeper.common;
 
 import static java.util.Objects.requireNonNull;
-import io.netty.handler.ssl.IdentityCipherSuiteFilter;
-import io.netty.handler.ssl.JdkSslContext;
-import io.netty.handler.ssl.SslContext;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.net.Socket;
 import java.util.Arrays;
-import java.util.Collections;
-import java.util.List;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLParameters;
 import javax.net.ssl.SSLServerSocket;
@@ -36,7 +31,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * Wrapper class for an SSLContext + some config options that can't be set on the context when it is created but
+ * Wrapper class for SSLContexts and config options that can't be set on the context when it is created but
  * must be set on a secure socket created by the context after the socket creation. By wrapping the options in this
  * class we avoid reading from global system properties during socket configuration. This makes testing easier
  * since we can create different X509Util instances with different configurations in a single test process, and
@@ -49,12 +44,35 @@ public class SSLContextAndOptions {
     private final X509Util x509Util;
     private final String[] enabledProtocols;
     private final String[] cipherSuites;
-    private final List<String> cipherSuitesAsList;
     private final X509Util.ClientAuth clientAuth;
-    private final SSLContext sslContext;
+    private final SSLContext clientSSLContext;
+    private final SSLContext serverSSLContext;
     private final int handshakeDetectionTimeoutMillis;
+    private final ZKConfig zkConfig;
 
     /**
+     * Creates an SSLContextAndOptions with separate client and server contexts.
+     * Note: constructor is intentionally package-private, only the X509Util class should be creating instances of this
+     * class.
+     * @param x509Util the X509Util that created this object.
+     * @param config a ZKConfig that holds config properties.
+     * @param clientSSLContext the SSLContext for connecting as a client.
+     * @param serverSSLContext the SSLContext for accepting connections as a server.
+     */
+    SSLContextAndOptions(final X509Util x509Util, final ZKConfig config,
+                         final SSLContext clientSSLContext, final SSLContext serverSSLContext) {
+        this.x509Util = requireNonNull(x509Util);
+        this.clientSSLContext = requireNonNull(clientSSLContext);
+        this.serverSSLContext = requireNonNull(serverSSLContext);
+        this.zkConfig = requireNonNull(config);
+        this.enabledProtocols = getEnabledProtocols(zkConfig, clientSSLContext);
+        this.cipherSuites = getCipherSuites(zkConfig);
+        this.clientAuth = getClientAuth(zkConfig);
+        this.handshakeDetectionTimeoutMillis = getHandshakeDetectionTimeoutMillis(zkConfig);
+    }
+
+    /**
+     * Creates an SSLContextAndOptions with a single context used for both roles.
      * Note: constructor is intentionally package-private, only the X509Util class should be creating instances of this
      * class.
      * @param x509Util the X509Util that created this object.
@@ -62,57 +80,36 @@ public class SSLContextAndOptions {
      * @param sslContext the SSLContext.
      */
     SSLContextAndOptions(final X509Util x509Util, final ZKConfig config, final SSLContext sslContext) {
-        this.x509Util = requireNonNull(x509Util);
-        this.sslContext = requireNonNull(sslContext);
-        this.enabledProtocols = getEnabledProtocols(requireNonNull(config), sslContext);
-        String[] ciphers = getCipherSuites(config);
-        this.cipherSuites = ciphers;
-        this.cipherSuitesAsList = Collections.unmodifiableList(Arrays.asList(ciphers));
-        this.clientAuth = getClientAuth(config);
-        this.handshakeDetectionTimeoutMillis = getHandshakeDetectionTimeoutMillis(config);
+        this(x509Util, config, sslContext, sslContext);
     }
 
-    public SSLContext getSSLContext() {
-        return sslContext;
+    public SSLContext getClientSSLContext() {
+        return clientSSLContext;
     }
 
     public SSLSocket createSSLSocket() throws IOException {
-        return configureSSLSocket((SSLSocket) sslContext.getSocketFactory().createSocket(), true);
+        return configureSSLSocket((SSLSocket) clientSSLContext.getSocketFactory().createSocket(), true);
     }
 
     public SSLSocket createSSLSocket(Socket socket, byte[] pushbackBytes) throws IOException {
         SSLSocket sslSocket;
         if (pushbackBytes != null && pushbackBytes.length > 0) {
-            sslSocket = (SSLSocket) sslContext.getSocketFactory()
+            sslSocket = (SSLSocket) serverSSLContext.getSocketFactory()
                                               .createSocket(socket, new ByteArrayInputStream(pushbackBytes), true);
         } else {
-            sslSocket = (SSLSocket) sslContext.getSocketFactory().createSocket(socket, null, socket.getPort(), true);
+            sslSocket = (SSLSocket) serverSSLContext.getSocketFactory().createSocket(socket, null, socket.getPort(), true);
         }
         return configureSSLSocket(sslSocket, false);
     }
 
     public SSLServerSocket createSSLServerSocket() throws IOException {
-        SSLServerSocket sslServerSocket = (SSLServerSocket) sslContext.getServerSocketFactory().createServerSocket();
+        SSLServerSocket sslServerSocket = (SSLServerSocket) serverSSLContext.getServerSocketFactory().createServerSocket();
         return configureSSLServerSocket(sslServerSocket);
     }
 
     public SSLServerSocket createSSLServerSocket(int port) throws IOException {
-        SSLServerSocket sslServerSocket = (SSLServerSocket) sslContext.getServerSocketFactory().createServerSocket(port);
+        SSLServerSocket sslServerSocket = (SSLServerSocket) serverSSLContext.getServerSocketFactory().createServerSocket(port);
         return configureSSLServerSocket(sslServerSocket);
-    }
-
-    public SslContext createNettyJdkSslContext(SSLContext sslContext, boolean isClientSocket) {
-        return new JdkSslContext(
-                sslContext,
-                isClientSocket,
-                cipherSuitesAsList,
-                IdentityCipherSuiteFilter.INSTANCE,
-                null,
-                isClientSocket
-                        ? X509Util.ClientAuth.NONE.toNettyClientAuth()
-                        : clientAuth.toNettyClientAuth(),
-                enabledProtocols,
-                false);
     }
 
     public int getHandshakeDetectionTimeoutMillis() {
@@ -165,12 +162,36 @@ public class SSLContextAndOptions {
                 break;
             }
         }
+
+        // In FIPS-mode we deal with hostname verification here,
+        // while in non-FIPS mode verification is handled by ZKTrustManager.
+        if (X509Util.getFipsMode(zkConfig)) {
+            String clientOrServer = isClientSocket ? "Server" : "Client";
+            if (isClientSocket) {
+                if (x509Util.isServerHostnameVerificationEnabled(zkConfig)) {
+                    sslParameters.setEndpointIdentificationAlgorithm("HTTPS");
+                    if (LOG.isDebugEnabled()) {
+                        LOG.debug("{} hostname verification: enabled HTTPS style endpoint identification algorithm", clientOrServer);
+                    }
+                }
+            } else {
+                if (x509Util.isClientHostnameVerificationEnabled(zkConfig)) {
+                    sslParameters.setEndpointIdentificationAlgorithm("HTTPS");
+                    if (LOG.isDebugEnabled()) {
+                        LOG.debug("{} hostname verification: enabled HTTPS style endpoint identification algorithm", clientOrServer);
+                    }
+                }
+            }
+        }
     }
 
     private String[] getEnabledProtocols(final ZKConfig config, final SSLContext sslContext) {
         String enabledProtocolsInput = config.getProperty(x509Util.getSslEnabledProtocolsProperty());
         if (enabledProtocolsInput == null) {
-            return new String[]{sslContext.getProtocol()};
+            // Use JDK defaults for enabled protocols:
+            // Protocol TLSv1.3 -> enabled protocols TLSv1.3 and TLSv1.2
+            // Protocol TLSv1.2 -> enabled protocols TLSv1.2
+            return sslContext.getDefaultSSLParameters().getProtocols();
         }
         return enabledProtocolsInput.split(",");
     }
@@ -178,7 +199,7 @@ public class SSLContextAndOptions {
     private String[] getCipherSuites(final ZKConfig config) {
         String cipherSuitesInput = config.getProperty(x509Util.getSslCipherSuitesProperty());
         if (cipherSuitesInput == null) {
-            return X509Util.getDefaultCipherSuites();
+            return null;
         } else {
             return cipherSuitesInput.split(",");
         }

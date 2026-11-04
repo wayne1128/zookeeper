@@ -36,7 +36,7 @@ import org.slf4j.LoggerFactory;
  * the connection layer always allows a connection to send at least one request
  * before disabling selection on that connection. Thus, in a scenario with 40000
  * client connections, the total number of requests inflight may be as high as
- * 40000 even if the <code>globalOustandingLimit</code> was set lower.
+ * 40000 even if the <code>globalOutstandingLimit</code> was set lower.
  *
  * The RequestThrottler addresses this issue by adding additional queueing. When
  * enabled, client connections no longer submit requests directly to the request
@@ -61,18 +61,18 @@ public class RequestThrottler extends ZooKeeperCriticalThread {
 
     private static final Logger LOG = LoggerFactory.getLogger(RequestThrottler.class);
 
-    private final LinkedBlockingQueue<Request> submittedRequests = new LinkedBlockingQueue<Request>();
+    private final LinkedBlockingQueue<Request> submittedRequests = new LinkedBlockingQueue<>();
 
     private final ZooKeeperServer zks;
     private volatile boolean stopping;
     private volatile boolean killed;
 
     private static final String SHUTDOWN_TIMEOUT = "zookeeper.request_throttler.shutdownTimeout";
-    private static int shutdownTimeout = 10000;
+    private static int shutdownTimeout;
 
     static {
         shutdownTimeout = Integer.getInteger(SHUTDOWN_TIMEOUT, 10000);
-        LOG.info("{} = {}", SHUTDOWN_TIMEOUT, shutdownTimeout);
+        LOG.info("{} = {} ms", SHUTDOWN_TIMEOUT, shutdownTimeout);
     }
 
     /**
@@ -195,13 +195,11 @@ public class RequestThrottler extends ZooKeeperCriticalThread {
         LOG.info("RequestThrottler shutdown. Dropped {} requests", dropped);
     }
 
-    private synchronized void throttleSleep(int stallTime) {
-        try {
-            ServerMetrics.getMetrics().REQUEST_THROTTLE_WAIT_COUNT.add(1);
-            this.wait(stallTime);
-        } catch (InterruptedException ie) {
-            return;
-        }
+
+    // @VisibleForTesting
+    synchronized void throttleSleep(int stallTime) throws InterruptedException {
+        ServerMetrics.getMetrics().REQUEST_THROTTLE_WAIT_COUNT.add(1);
+        this.wait(stallTime);
     }
 
     @SuppressFBWarnings(value = "NN_NAKED_NOTIFY", justification = "state change is in ZooKeeperServer.decInProgress() ")

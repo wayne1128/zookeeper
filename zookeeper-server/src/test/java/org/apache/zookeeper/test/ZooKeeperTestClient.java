@@ -18,9 +18,9 @@
 
 package org.apache.zookeeper.test;
 
-import static org.junit.Assert.assertNotNull;
-import static org.junit.Assert.assertTrue;
-import static org.junit.Assert.fail;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.fail;
 import java.io.IOException;
 import java.util.List;
 import java.util.concurrent.LinkedBlockingQueue;
@@ -45,7 +45,7 @@ public class ZooKeeperTestClient extends ZKTestCase implements Watcher {
 
     protected String testDirOnZK = dirOnZK + "/" + Time.currentElapsedTime();
 
-    LinkedBlockingQueue<WatchedEvent> events = new LinkedBlockingQueue<WatchedEvent>();
+    LinkedBlockingQueue<WatchedEvent> events = new LinkedBlockingQueue<>();
 
     private WatchedEvent getEvent(int numTries) throws InterruptedException {
         WatchedEvent event = null;
@@ -131,7 +131,7 @@ public class ZooKeeperTestClient extends ZKTestCase implements Watcher {
             Code code = ke.code();
             boolean valid = code == KeeperException.Code.NODEEXISTS;
             if (!valid) {
-                fail("Unexpected exception code for createin: " + ke.getMessage());
+                fail("Unexpected exception code for create: " + ke.getMessage());
             }
         }
 
@@ -207,7 +207,7 @@ public class ZooKeeperTestClient extends ZKTestCase implements Watcher {
             Code code = ke.code();
             boolean valid = code == KeeperException.Code.NODEEXISTS;
             if (!valid) {
-                fail("Unexpected exception code for createin: " + ke.getMessage());
+                fail("Unexpected exception code for create: " + ke.getMessage());
             }
         }
 
@@ -243,7 +243,7 @@ public class ZooKeeperTestClient extends ZKTestCase implements Watcher {
             Code code = ke.code();
             boolean valid = code == KeeperException.Code.NOCHILDRENFOREPHEMERALS;
             if (!valid) {
-                fail("Unexpected exception code for createin: " + code);
+                fail("Unexpected exception code for create: " + code);
             }
         }
 
@@ -262,7 +262,7 @@ public class ZooKeeperTestClient extends ZKTestCase implements Watcher {
             Code code = ke.code();
             boolean valid = code == KeeperException.Code.NONODE;
             if (!valid) {
-                fail("Unexpected exception code for createin: " + code);
+                fail("Unexpected exception code for create: " + code);
             }
         }
         firstGen1 = zk_1.getChildren(parentName, true);

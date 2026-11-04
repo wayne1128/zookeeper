@@ -18,20 +18,25 @@
 
 package org.apache.zookeeper.server.quorum;
 
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertFalse;
-import static org.junit.Assert.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import java.io.File;
 import java.io.IOException;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.nio.file.Files;
 import java.util.HashMap;
 import java.util.Map;
 import org.apache.zookeeper.PortAssignment;
 import org.apache.zookeeper.server.quorum.QuorumPeer.LearnerType;
 import org.apache.zookeeper.server.quorum.QuorumPeer.QuorumServer;
-import org.apache.zookeeper.test.ClientBase;
-import org.junit.Test;
+import org.apache.zookeeper.server.quorum.flexible.QuorumMaj;
+import org.apache.zookeeper.server.quorum.flexible.QuorumVerifier;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+import org.mockito.Mockito;
 
 public class QuorumPeerTest {
 
@@ -45,11 +50,10 @@ public class QuorumPeerTest {
      * Test case for https://issues.apache.org/jira/browse/ZOOKEEPER-2301
      */
     @Test
-    public void testQuorumPeerListendOnSpecifiedClientIP() throws IOException {
+    public void testQuorumPeerListendOnSpecifiedClientIP(@TempDir File dataDir) throws IOException {
         long myId = 1;
-        File dataDir = ClientBase.createTmpDir();
         int clientPort = PortAssignment.unique();
-        Map<Long, QuorumServer> peersView = new HashMap<Long, QuorumServer>();
+        Map<Long, QuorumServer> peersView = new HashMap<>();
         InetAddress clientIP = InetAddress.getLoopbackAddress();
 
         peersView.put(Long.valueOf(myId), new QuorumServer(myId, new InetSocketAddress(clientIP, PortAssignment.unique()), new InetSocketAddress(clientIP, PortAssignment.unique()), new InetSocketAddress(clientIP, clientPort), LearnerType.PARTICIPANT));
@@ -75,6 +79,34 @@ public class QuorumPeerTest {
         assertEquals(clientIP.getHostAddress(), hostString2);
         // cleanup
         peer2.shutdown();
+    }
+
+    @Test
+    public void testShutdownWithoutZkDbDoesNotThrow() throws Exception {
+        QuorumPeer peer = new QuorumPeer();
+        assertDoesNotThrow(peer::shutdown);
+    }
+
+    @Test
+    public void testProcessReconfigWillRecreateSocketAddresses() throws IOException {
+        QuorumPeerConfig.setReconfigEnabled(true);
+        QuorumPeer peer = new QuorumPeer();
+
+        File file = Files.createTempFile("", ".tmp").toFile();
+        file.deleteOnExit();
+
+        peer.setConfigFileName(file.getAbsoluteFile().toString());
+
+        Map<Long, QuorumServer> peersView = new HashMap<>();
+        QuorumServer qs = Mockito.mock(QuorumServer.class);
+        peersView.put(0L, qs);
+
+        QuorumVerifier qv = new QuorumMaj(peersView);
+        peer.setQuorumVerifier(qv, false);
+        peer.processReconfig(qv, 0L, 0L, false);
+
+        // verify the qs will recreateSocketAddresses twice for both the old qv and the new qv
+        Mockito.verify(qs, Mockito.times(2)).recreateSocketAddresses();
     }
 
     @Test

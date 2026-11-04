@@ -18,17 +18,21 @@
 
 package org.apache.zookeeper.server;
 
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertNotNull;
-import static org.junit.Assert.assertNull;
-import static org.junit.Assert.fail;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.fail;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicLong;
 import org.apache.zookeeper.AsyncCallback;
 import org.apache.zookeeper.CreateMode;
+import org.apache.zookeeper.CreateOptions;
 import org.apache.zookeeper.KeeperException;
 import org.apache.zookeeper.KeeperException.Code;
 import org.apache.zookeeper.Op;
@@ -36,12 +40,16 @@ import org.apache.zookeeper.OpResult;
 import org.apache.zookeeper.TestableZooKeeper;
 import org.apache.zookeeper.ZooDefs;
 import org.apache.zookeeper.data.Stat;
+import org.apache.zookeeper.metrics.MetricsUtils;
 import org.apache.zookeeper.proto.CreateResponse;
 import org.apache.zookeeper.proto.CreateTTLRequest;
 import org.apache.zookeeper.proto.ReplyHeader;
 import org.apache.zookeeper.proto.RequestHeader;
 import org.apache.zookeeper.test.ClientBase;
-import org.junit.Test;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.TestInfo;
 
 public class CreateTTLTest extends ClientBase {
 
@@ -51,13 +59,20 @@ public class CreateTTLTest extends ClientBase {
 
     @Override
     public void setUp() throws Exception {
+        // to be able to get the test method name a testInfo object is needed
+        // to override the parent's setUp method we need this empty method
+    }
+
+    @BeforeEach
+    public void setUp(TestInfo testInfo) throws Exception {
         System.setProperty(
             EphemeralType.EXTENDED_TYPES_ENABLED_PROPERTY,
-            disabledTests.contains(getTestName()) ? "false" : "true");
+            disabledTests.contains(testInfo.getTestMethod().get().getName()) ? "false" : "true");
         super.setUpWithServerId(254);
         zk = createClient();
     }
 
+    @AfterEach
     @Override
     public void tearDown() throws Exception {
         System.clearProperty(EphemeralType.EXTENDED_TYPES_ENABLED_PROPERTY);
@@ -74,11 +89,16 @@ public class CreateTTLTest extends ClientBase {
         final AtomicLong fakeElapsed = new AtomicLong(0);
         ContainerManager containerManager = newContainerManager(fakeElapsed);
         containerManager.checkContainers();
-        assertNotNull("Ttl node should not have been deleted yet", zk.exists("/foo", false));
+        assertNotNull(zk.exists("/foo", false), "Ttl node should not have been deleted yet");
 
         fakeElapsed.set(1000);
         containerManager.checkContainers();
-        assertNull("Ttl node should have been deleted", zk.exists("/foo", false));
+        assertNull(zk.exists("/foo", false), "Ttl node should have been deleted");
+
+        // validate created and deleted TTL nodes count
+        Map<String, Object> metrics = MetricsUtils.currentServerMetrics();
+        assertTrue((long) metrics.get("ttl_node_created_count") >= 1);
+        assertTrue((long) metrics.get("ttl_node_deleted_count") >= 1);
     }
 
     @Test
@@ -89,16 +109,16 @@ public class CreateTTLTest extends ClientBase {
         CreateTTLRequest request = new CreateTTLRequest(path, new byte[0], ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT_WITH_TTL.toFlag(), -100);
         CreateResponse response = new CreateResponse();
         ReplyHeader r = zk.submitRequest(h, request, response, null);
-        assertEquals("An invalid CreateTTLRequest should throw BadArguments", r.getErr(), Code.BADARGUMENTS.intValue());
-        assertNull("An invalid CreateTTLRequest should not result in znode creation", zk.exists(path, false));
+        assertEquals(r.getErr(), Code.BADARGUMENTS.intValue(), "An invalid CreateTTLRequest should throw BadArguments");
+        assertNull(zk.exists(path, false), "An invalid CreateTTLRequest should not result in znode creation");
 
         request = new CreateTTLRequest(path, new byte[0], ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT_WITH_TTL.toFlag(),
                                        EphemeralType.TTL.maxValue()
                                                + 1);
         response = new CreateResponse();
         r = zk.submitRequest(h, request, response, null);
-        assertEquals("An invalid CreateTTLRequest should throw BadArguments", r.getErr(), Code.BADARGUMENTS.intValue());
-        assertNull("An invalid CreateTTLRequest should not result in znode creation", zk.exists(path, false));
+        assertEquals(r.getErr(), Code.BADARGUMENTS.intValue(), "An invalid CreateTTLRequest should throw BadArguments");
+        assertNull(zk.exists(path, false), "An invalid CreateTTLRequest should not result in znode creation");
     }
 
     @Test
@@ -109,8 +129,8 @@ public class CreateTTLTest extends ClientBase {
         CreateTTLRequest request = new CreateTTLRequest(path, new byte[0], ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT_WITH_TTL.toFlag(), EphemeralType.TTL.maxValue());
         CreateResponse response = new CreateResponse();
         ReplyHeader r = zk.submitRequest(h, request, response, null);
-        assertEquals("EphemeralType.getMaxTTL() should succeed", r.getErr(), Code.OK.intValue());
-        assertNotNull("Node should exist", zk.exists(path, false));
+        assertEquals(r.getErr(), Code.OK.intValue(), "EphemeralType.getMaxTTL() should succeed");
+        assertNotNull(zk.exists(path, false), "Node should exist");
     }
 
     @Test
@@ -122,11 +142,11 @@ public class CreateTTLTest extends ClientBase {
         final AtomicLong fakeElapsed = new AtomicLong(0);
         ContainerManager containerManager = newContainerManager(fakeElapsed);
         containerManager.checkContainers();
-        assertNotNull("Ttl node should not have been deleted yet", zk.exists(path, false));
+        assertNotNull(zk.exists(path, false), "Ttl node should not have been deleted yet");
 
         fakeElapsed.set(1000);
         containerManager.checkContainers();
-        assertNull("Ttl node should have been deleted", zk.exists(path, false));
+        assertNull(zk.exists(path, false), "Ttl node should have been deleted");
     }
 
     @Test
@@ -139,11 +159,11 @@ public class CreateTTLTest extends ClientBase {
         final AtomicLong fakeElapsed = new AtomicLong(0);
         ContainerManager containerManager = newContainerManager(fakeElapsed);
         containerManager.checkContainers();
-        assertNotNull("Ttl node should not have been deleted yet", zk.exists("/foo", false));
+        assertNotNull(zk.exists("/foo", false), "Ttl node should not have been deleted yet");
 
         fakeElapsed.set(1000);
         containerManager.checkContainers();
-        assertNull("Ttl node should have been deleted", zk.exists("/foo", false));
+        assertNull(zk.exists("/foo", false), "Ttl node should have been deleted");
     }
 
     @Test
@@ -155,46 +175,63 @@ public class CreateTTLTest extends ClientBase {
         final AtomicLong fakeElapsed = new AtomicLong(0);
         ContainerManager containerManager = newContainerManager(fakeElapsed);
         containerManager.checkContainers();
-        assertNotNull("Ttl node should not have been deleted yet", zk.exists("/foo", false));
+        assertNotNull(zk.exists("/foo", false), "Ttl node should not have been deleted yet");
 
         for (int i = 0; i < 10; ++i) {
             fakeElapsed.set(50);
             zk.setData("/foo", new byte[i + 1], -1);
             containerManager.checkContainers();
-            assertNotNull("Ttl node should not have been deleted yet", zk.exists("/foo", false));
+            assertNotNull(zk.exists("/foo", false), "Ttl node should not have been deleted yet");
         }
 
         fakeElapsed.set(200);
         containerManager.checkContainers();
-        assertNull("Ttl node should have been deleted", zk.exists("/foo", false));
+        assertNull(zk.exists("/foo", false), "Ttl node should have been deleted");
     }
 
     @Test
     public void testMulti() throws KeeperException, InterruptedException {
-        Op createTtl = Op.create("/a", new byte[0], ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT_WITH_TTL, 100);
-        Op createTtlSequential = Op.create("/b", new byte[0], ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT_SEQUENTIAL_WITH_TTL, 200);
+        CreateOptions options = CreateOptions
+                .newBuilder(ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT_WITH_TTL)
+                .withTtl(100)
+                .build();
+        CreateOptions sequentialOptions = CreateOptions
+                .newBuilder(ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT_SEQUENTIAL_WITH_TTL)
+                .withTtl(200)
+                .build();
+        Op createTtl = Op.create("/a", new byte[0], options.getAcl(), options.getCreateMode(), options.getTtl());
+        Op createTtl2 = Op.create("/a2", new byte[0], options);
+        Op createTtlSequential = Op.create("/b", new byte[0], sequentialOptions.getAcl(), sequentialOptions.getCreateMode(), sequentialOptions.getTtl());
+        Op createTtlSequential2 = Op.create("/b2", new byte[0], sequentialOptions);
         Op createNonTtl = Op.create("/c", new byte[0], ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
-        List<OpResult> results = zk.multi(Arrays.asList(createTtl, createTtlSequential, createNonTtl));
-        String sequentialPath = ((OpResult.CreateResult) results.get(1)).getPath();
+        List<OpResult> results = zk.multi(Arrays.asList(createTtl, createTtl2, createTtlSequential, createTtlSequential2, createNonTtl));
+        String sequentialPath = ((OpResult.CreateResult) results.get(2)).getPath();
+        String sequentialPath2 = ((OpResult.CreateResult) results.get(3)).getPath();
 
         final AtomicLong fakeElapsed = new AtomicLong(0);
         ContainerManager containerManager = newContainerManager(fakeElapsed);
         containerManager.checkContainers();
-        assertNotNull("node should not have been deleted yet", zk.exists("/a", false));
-        assertNotNull("node should not have been deleted yet", zk.exists(sequentialPath, false));
-        assertNotNull("node should never be deleted", zk.exists("/c", false));
+        assertNotNull(zk.exists("/a", false), "node should not have been deleted yet");
+        assertNotNull(zk.exists("/a2", false), "node should not have been deleted yet");
+        assertNotNull(zk.exists(sequentialPath, false), "node should not have been deleted yet");
+        assertNotNull(zk.exists(sequentialPath2, false), "node should not have been deleted yet");
+        assertNotNull(zk.exists("/c", false), "node should never be deleted");
 
         fakeElapsed.set(110);
         containerManager.checkContainers();
-        assertNull("node should have been deleted", zk.exists("/a", false));
-        assertNotNull("node should not have been deleted yet", zk.exists(sequentialPath, false));
-        assertNotNull("node should never be deleted", zk.exists("/c", false));
+        assertNull(zk.exists("/a", false), "node should have been deleted");
+        assertNull(zk.exists("/a2", false), "node should have been deleted");
+        assertNotNull(zk.exists(sequentialPath, false), "node should not have been deleted yet");
+        assertNotNull(zk.exists(sequentialPath2, false), "node should not have been deleted yet");
+        assertNotNull(zk.exists("/c", false), "node should never be deleted");
 
         fakeElapsed.set(210);
         containerManager.checkContainers();
-        assertNull("node should have been deleted", zk.exists("/a", false));
-        assertNull("node should have been deleted", zk.exists(sequentialPath, false));
-        assertNotNull("node should never be deleted", zk.exists("/c", false));
+        assertNull(zk.exists("/a", false), "node should have been deleted");
+        assertNull(zk.exists("/a2", false), "node should have been deleted");
+        assertNull(zk.exists(sequentialPath, false), "node should have been deleted");
+        assertNull(zk.exists(sequentialPath2, false), "node should have been deleted");
+        assertNotNull(zk.exists("/c", false), "node should never be deleted");
     }
 
     @Test
@@ -236,10 +273,12 @@ public class CreateTTLTest extends ClientBase {
         }
     }
 
-    @Test(expected = KeeperException.UnimplementedException.class)
+    @Test
     public void testDisabled() throws KeeperException, InterruptedException {
-        // note, setUp() enables this test based on the test name
-        zk.create("/foo", new byte[0], ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT_WITH_TTL, new Stat(), 100);
+        assertThrows(KeeperException.UnimplementedException.class, () -> {
+            // note, setUp() enables this test based on the test name
+            zk.create("/foo", new byte[0], ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT_WITH_TTL, new Stat(), 100);
+        });
     }
 
     private ContainerManager newContainerManager(final AtomicLong fakeElapsed) {

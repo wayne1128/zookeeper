@@ -26,8 +26,9 @@ package org.apache.zookeeper;
  */
 
 import java.util.Date;
-import java.util.Random;
 import java.util.Set;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.function.Supplier;
 import javax.security.auth.Subject;
 import javax.security.auth.callback.CallbackHandler;
 import javax.security.auth.kerberos.KerberosPrincipal;
@@ -36,6 +37,9 @@ import javax.security.auth.login.AppConfigurationEntry;
 import javax.security.auth.login.Configuration;
 import javax.security.auth.login.LoginContext;
 import javax.security.auth.login.LoginException;
+import org.apache.zookeeper.audit.AuditConstants;
+import org.apache.zookeeper.audit.AuditEvent.Result;
+import org.apache.zookeeper.audit.ZKAuditProvider;
 import org.apache.zookeeper.client.ZKClientConfig;
 import org.apache.zookeeper.common.Time;
 import org.apache.zookeeper.common.ZKConfig;
@@ -48,7 +52,7 @@ public class Login {
     private static final String KINIT_COMMAND_DEFAULT = "/usr/bin/kinit";
     private static final Logger LOG = LoggerFactory.getLogger(Login.class);
     public static final String SYSTEM_USER = System.getProperty("user.name", "<NA>");
-    public CallbackHandler callbackHandler;
+    private final Supplier<CallbackHandler> callbackHandlerSupplier;
 
     // LoginThread will sleep until 80% of time from last refresh to
     // ticket's expiry has been reached, at which time it will wake
@@ -63,19 +67,25 @@ public class Login {
     // Regardless of TICKET_RENEW_WINDOW setting above and the ticket expiry time,
     // thread will not sleep between refresh attempts any less than 1 minute (60*1000 milliseconds = 1 minute).
     // Change the '1' to e.g. 5, to change this to 5 minutes.
-    private static final long MIN_TIME_BEFORE_RELOGIN = 1 * 60 * 1000L;
+    private static final long DEFAULT_MIN_TIME_BEFORE_RELOGIN = 1 * 60 * 1000L;
+    public static final String MIN_TIME_BEFORE_RELOGIN_CONFIG_KEY = "zookeeper.kerberos.minReLoginTimeMs";
+    private static final long MIN_TIME_BEFORE_RELOGIN = Long.getLong(
+      MIN_TIME_BEFORE_RELOGIN_CONFIG_KEY, DEFAULT_MIN_TIME_BEFORE_RELOGIN);
+
+    private static final long DEFAULT_SHUTDOWN_TIMEOUT = 5 * 1000L;
+    public static final String SHUTDOWN_TIMEOUT_CONFIG_KEY = "zookeeper.kerberos.shutdownTimeoutMs";
+    private static final long SHUTDOWN_TIMEOUT = Math.max(0L,
+            Long.getLong(SHUTDOWN_TIMEOUT_CONFIG_KEY, DEFAULT_SHUTDOWN_TIMEOUT));
 
     private Subject subject = null;
     private Thread t = null;
     private boolean isKrbTicket = false;
     private boolean isUsingTicketCache = false;
 
-    /** Random number generator */
-    private static Random rng = new Random();
-
     private LoginContext login = null;
     private String loginContextName = null;
-    private String principal = null;
+    private final String principal;
+    private volatile String auditPrincipal = SYSTEM_USER;
 
     // Initialize 'lastLogin' to do a login at first time
     private long lastLogin = Time.currentElapsedTime() - MIN_TIME_BEFORE_RELOGIN;
@@ -89,35 +99,22 @@ public class Login {
      *            name of section in JAAS file that will be use to login. Passed
      *            as first param to javax.security.auth.login.LoginContext().
      *
-     * @param callbackHandler
-     *            Passed as second param to
-     *            javax.security.auth.login.LoginContext().
+     * @param callbackHandlerSupplier
+     *            Per connection callbackhandler supplier.
+     *
      * @param zkConfig
      *            client or server configurations
      * @throws javax.security.auth.login.LoginException
      *             Thrown if authentication fails.
      */
-    public Login(final String loginContextName, CallbackHandler callbackHandler, final ZKConfig zkConfig) throws LoginException {
+    public Login(final String loginContextName, Supplier<CallbackHandler> callbackHandlerSupplier, final ZKConfig zkConfig) throws LoginException {
         this.zkConfig = zkConfig;
-        this.callbackHandler = callbackHandler;
+        this.callbackHandlerSupplier = callbackHandlerSupplier;
+        principal = readLoginConfiguration(loginContextName);
         login = login(loginContextName);
         this.loginContextName = loginContextName;
         subject = login.getSubject();
         isKrbTicket = !subject.getPrivateCredentials(KerberosTicket.class).isEmpty();
-        AppConfigurationEntry[] entries = Configuration.getConfiguration().getAppConfigurationEntry(loginContextName);
-        for (AppConfigurationEntry entry : entries) {
-            // there will only be a single entry, so this for() loop will only be iterated through once.
-            if (entry.getOptions().get("useTicketCache") != null) {
-                String val = (String) entry.getOptions().get("useTicketCache");
-                if (val.equals("true")) {
-                    isUsingTicketCache = true;
-                }
-            }
-            if (entry.getOptions().get("principal") != null) {
-                principal = (String) entry.getOptions().get("principal");
-            }
-            break;
-        }
 
         if (!isKrbTicket) {
             // if no TGT, do not bother with ticket management.
@@ -131,7 +128,7 @@ public class Login {
         t = new Thread(new Runnable() {
             public void run() {
                 LOG.info("TGT refresh thread started.");
-                while (true) {  // renewal thread's main loop. if it exits from here, thread will exit.
+                while (!Thread.currentThread().isInterrupted()) {  // renewal thread's main loop. if it exits from here, thread will exit.
                     KerberosTicket tgt = getTGT();
                     long now = Time.currentWallTime();
                     long nextRefresh;
@@ -222,11 +219,12 @@ public class Login {
                                 Shell.execCommand(cmd, kinitArgs);
                                 break;
                             } catch (Exception e) {
+                                audit(getAuditUser(subject), AuditConstants.OP_TICKET_RENEWAL, Result.FAILURE);
                                 if (retry > 0) {
                                     --retry;
                                     // sleep for 10 seconds
                                     try {
-                                        Thread.sleep(10 * 1000);
+                                        sleepBeforeRetryFailedRefresh();
                                     } catch (InterruptedException ie) {
                                         LOG.error("Interrupted while renewing TGT, exiting Login thread");
                                         return;
@@ -254,13 +252,14 @@ public class Login {
                                     --retry;
                                     // sleep for 10 seconds.
                                     try {
-                                        Thread.sleep(10 * 1000);
+                                        sleepBeforeRetryFailedRefresh();
                                     } catch (InterruptedException e) {
                                         LOG.error("Interrupted during login retry after LoginException:", le);
                                         throw le;
                                     }
                                 } else {
                                     LOG.error("Could not refresh TGT for principal: {}.", principal, le);
+                                    break;
                                 }
                             }
                         }
@@ -274,6 +273,17 @@ public class Login {
         t.setDaemon(true);
     }
 
+    /**
+     * Return a new CallbackHandler for connections
+     * to avoid race conditions and state sharing in
+     * connection login processing.
+     *
+     * @return connection dependent CallbackHandler
+     */
+    public CallbackHandler newCallbackHandler() {
+        return callbackHandlerSupplier.get();
+    }
+
     public void startThreadIfNeeded() {
         // thread object 't' will be null if a refresh thread is not needed.
         if (t != null) {
@@ -285,9 +295,13 @@ public class Login {
         if ((t != null) && (t.isAlive())) {
             t.interrupt();
             try {
-                t.join();
+                t.join(SHUTDOWN_TIMEOUT);
+                if (t.isAlive()) {
+                    LOG.warn("TGT renewal thread did not exit within {} ms", SHUTDOWN_TIMEOUT);
+                }
             } catch (InterruptedException e) {
                 LOG.warn("error while waiting for Login thread to shutdown.", e);
+                Thread.currentThread().interrupt();
             }
         }
     }
@@ -308,17 +322,86 @@ public class Login {
     }
 
     private synchronized LoginContext login(final String loginContextName) throws LoginException {
-        if (loginContextName == null) {
-            throw new LoginException("loginContext name (JAAS file section header) was null. "
-                                     + "Please check your java.security.login.auth.config (="
-                                     + System.getProperty("java.security.login.auth.config")
-                                     + ") and your "
-                                     + getLoginContextMessage());
+        try {
+            if (loginContextName == null) {
+                throw new LoginException("loginContext name (JAAS file section header) was null. "
+                                         + "Please check your java.security.login.auth.config (="
+                                         + System.getProperty("java.security.login.auth.config")
+                                         + ") and your "
+                                         + getLoginContextMessage());
+            }
+            LoginContext loginContext = new LoginContext(loginContextName, newCallbackHandler());
+            loginContext.login();
+            // Retain the authenticated identity even if a later logout clears the subject.
+            auditPrincipal = getAuditUser(loginContext.getSubject());
+            audit(auditPrincipal, AuditConstants.OP_LOGIN, Result.SUCCESS);
+            LOG.info("{} successfully logged in.", loginContextName);
+            return loginContext;
+        } catch (LoginException e) {
+            audit(auditPrincipal, AuditConstants.OP_LOGIN, Result.FAILURE);
+            throw e;
         }
-        LoginContext loginContext = new LoginContext(loginContextName, callbackHandler);
-        loginContext.login();
-        LOG.info("{} successfully logged in.", loginContextName);
-        return loginContext;
+    }
+
+    private String readLoginConfiguration(String loginContextName) {
+        if (loginContextName == null) {
+            return null;
+        }
+        // LoginContext falls back to "other" when the named configuration is absent.
+        Configuration configuration = Configuration.getConfiguration();
+        AppConfigurationEntry[] entries = configuration.getAppConfigurationEntry(loginContextName);
+        if (entries == null) {
+            entries = configuration.getAppConfigurationEntry("other");
+        }
+        if (entries != null && entries.length > 0) {
+            AppConfigurationEntry entry = entries[0];
+            isUsingTicketCache = "true".equals(entry.getOptions().get("useTicketCache"));
+            Object principalOption = entry.getOptions().get("principal");
+            String configuredUser = null;
+            // A Kerberos module can follow other modules in the JAAS chain.
+            for (AppConfigurationEntry configuredEntry : entries) {
+                Object configuredValue = configuredEntry.getOptions().get("principal");
+                if (configuredValue instanceof String configuredPrincipal && !configuredPrincipal.isEmpty()) {
+                    configuredUser = configuredPrincipal;
+                    break;
+                }
+                Object username = configuredEntry.getOptions().get("username");
+                if (configuredUser == null && username instanceof String && !((String) username).isEmpty()) {
+                    configuredUser = (String) username;
+                }
+            }
+            if (configuredUser != null) {
+                auditPrincipal = configuredUser;
+            }
+            return principalOption instanceof String ? (String) principalOption : null;
+        }
+        return null;
+    }
+
+    private String getAuditUser(Subject loginSubject) {
+        if (loginSubject != null) {
+            for (KerberosPrincipal kerberosPrincipal : loginSubject.getPrincipals(KerberosPrincipal.class)) {
+                return kerberosPrincipal.getName();
+            }
+            // SecurityUtils uses the public credential as the DIGEST-MD5 username.
+            for (String username : loginSubject.getPublicCredentials(String.class)) {
+                if (!username.isEmpty()) {
+                    return username;
+                }
+            }
+        }
+        return auditPrincipal;
+    }
+
+    private void audit(String user, String operation, Result result) {
+        try {
+            // An early client must not freeze audit configuration while auditing is disabled.
+            if (Boolean.getBoolean(ZKAuditProvider.AUDIT_ENABLE)) {
+                ZKAuditProvider.log(user, operation, result);
+            }
+        } catch (RuntimeException | LinkageError e) {
+            LOG.error("Unable to audit {} ({}) for {}", operation, result, user, e);
+        }
     }
 
     private String getLoginContextMessage() {
@@ -341,7 +424,9 @@ public class Login {
         long expires = tgt.getEndTime().getTime();
         LOG.info("TGT valid starting at:        {}", tgt.getStartTime().toString());
         LOG.info("TGT expires:                  {}", tgt.getEndTime().toString());
-        long proposedRefresh = start + (long) ((expires - start) * (TICKET_RENEW_WINDOW + (TICKET_RENEW_JITTER * rng.nextDouble())));
+        long proposedRefresh = start + (long) ((expires - start)
+            * (TICKET_RENEW_WINDOW + (TICKET_RENEW_JITTER
+                * ThreadLocalRandom.current().nextDouble())));
         if (proposedRefresh > expires) {
             // proposedRefresh is too far in the future: it's after ticket expires: simply return now.
             return Time.currentWallTime();
@@ -363,7 +448,7 @@ public class Login {
         return null;
     }
 
-    private boolean hasSufficientTimeElapsed() {
+    private boolean tryBeginReLogin() {
         long now = Time.currentElapsedTime();
         if (now - getLastLogin() < MIN_TIME_BEFORE_RELOGIN) {
             LOG.warn("Not attempting to re-login since the last re-login was "
@@ -401,10 +486,10 @@ public class Login {
     }
 
     /**
-     * Get the time of the last login.
-     * @return the number of milliseconds since the beginning of time.
+     * Get the time of the last login (ticket initialization or last ticket renewal).
+     * @return the number of milliseconds since epoch.
      */
-    private long getLastLogin() {
+    public long getLastLogin() {
         return lastLogin;
     }
 
@@ -413,7 +498,7 @@ public class Login {
      * @throws javax.security.auth.login.LoginException on a failure
      */
     // c.f. HADOOP-6559
-    private synchronized void reLogin() throws LoginException {
+    synchronized void reLogin() throws LoginException {
         if (!isKrbTicket) {
             return;
         }
@@ -421,22 +506,46 @@ public class Login {
         if (login == null) {
             throw new LoginException("login must be done first");
         }
-        if (!hasSufficientTimeElapsed()) {
+        if (!tryBeginReLogin()) {
             return;
         }
+        String user = getAuditUser(subject);
         LOG.info("Initiating logout for {}", principal);
         synchronized (Login.class) {
-            //clear up the kerberos state. But the tokens are not cleared! As per
-            //the Java kerberos login module code, only the kerberos credentials
-            //are cleared
-            login.logout();
-            //login and also update the subject field of this instance to
-            //have the new credentials (pass it to the LoginContext constructor)
-            login = new LoginContext(loginContextName, getSubject());
-            LOG.info("Initiating re-login for {}", principal);
-            login.login();
-            setLogin(login);
+            try {
+                logout();
+                login = new LoginContext(loginContextName, getSubject());
+                LOG.info("Initiating re-login for {}", principal);
+                login.login();
+                setLogin(login);
+                auditPrincipal = getAuditUser(login.getSubject());
+                audit(auditPrincipal, AuditConstants.OP_TICKET_RENEWAL, Result.SUCCESS);
+            } catch (LoginException e) {
+                audit(user, AuditConstants.OP_TICKET_RENEWAL, Result.FAILURE);
+                throw e;
+            }
         }
     }
 
+    // this method also visible for unit tests, to make sure kerberos state cleaned up
+    protected synchronized void logout() throws LoginException {
+        // We need to make sure not to call LoginContext.logout() when we
+        // are not logged in. Since Java 9 this could result in an NPE.
+        // See ZOOKEEPER-4477 for more details.
+        if (subject != null && !subject.getPrincipals().isEmpty()) {
+            String user = getAuditUser(subject);
+            try {
+                login.logout();
+                audit(user, AuditConstants.OP_LOGOUT, Result.SUCCESS);
+            } catch (LoginException e) {
+                audit(user, AuditConstants.OP_LOGOUT, Result.FAILURE);
+                throw e;
+            }
+        }
+    }
+
+    // this method is overwritten in unit tests to test concurrency
+    protected void sleepBeforeRetryFailedRefresh() throws InterruptedException {
+        Thread.sleep(10 * 1000);
+    }
 }

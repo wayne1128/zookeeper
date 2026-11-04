@@ -18,7 +18,7 @@
 
 package org.apache.zookeeper.test;
 
-import static org.junit.Assert.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -31,7 +31,7 @@ import org.apache.zookeeper.ZooKeeper;
 import org.apache.zookeeper.proto.ConnectRequest;
 import org.apache.zookeeper.proto.CreateRequest;
 import org.apache.zookeeper.proto.RequestHeader;
-import org.junit.Test;
+import org.junit.jupiter.api.Test;
 
 public class SessionInvalidationTest extends ClientBase {
 
@@ -41,7 +41,7 @@ public class SessionInvalidationTest extends ClientBase {
      *
      * We're using our own marshalling here in order to force an operation
      * after the session is closed (ZooKeeper.class will not allow this). Also
-     * by filling the pipe with operations it increases the likelyhood that
+     * by filling the pipe with operations it increases the likelihood that
      * the server will process the create before FinalRequestProcessor
      * removes the session from the tracker.
      */
@@ -53,7 +53,7 @@ public class SessionInvalidationTest extends ClientBase {
 
             // open a connection
             boa.writeInt(44, "len");
-            ConnectRequest conReq = new ConnectRequest(0, 0, 30000, 0, new byte[16]);
+            ConnectRequest conReq = new ConnectRequest(0, 0, 30000, 0, new byte[16], false);
             conReq.serialize(boa, "connect");
 
             // close connection

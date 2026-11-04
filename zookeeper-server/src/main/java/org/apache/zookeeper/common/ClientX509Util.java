@@ -18,9 +18,17 @@
 
 package org.apache.zookeeper.common;
 
+/**
+ * X509 utilities specific for client-server communication framework.
+ *
+ * <p>This class is intentionally free of Netty dependencies so it can be loaded
+ * without Netty on the classpath. For Netty SSL context creation use
+ * {@link ClientNettyX509Util}.
+ */
 public class ClientX509Util extends X509Util {
 
     private final String sslAuthProviderProperty = getConfigPrefix() + "authProvider";
+    private final String sslProviderProperty = getConfigPrefix() + "sslProvider";
 
     @Override
     protected String getConfigPrefix() {
@@ -36,4 +44,7 @@ public class ClientX509Util extends X509Util {
         return sslAuthProviderProperty;
     }
 
+    public String getSslProviderProperty() {
+        return sslProviderProperty;
+    }
 }

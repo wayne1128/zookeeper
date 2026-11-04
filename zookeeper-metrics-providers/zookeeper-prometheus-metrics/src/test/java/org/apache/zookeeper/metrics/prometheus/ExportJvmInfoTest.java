@@ -18,16 +18,14 @@
 
 package org.apache.zookeeper.metrics.prometheus;
 
-import static org.junit.Assert.assertEquals;
-import io.prometheus.client.CollectorRegistry;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import java.util.Properties;
-import org.junit.Test;
+import org.junit.jupiter.api.Test;
 
 /**
- * Tests about Prometheus Metrics Provider. Please note that we are not testing
- * Prometheus but our integration.
+ * Tests about Prometheus Metrics Provider. Please note that we are not testing Prometheus but our integration.
  */
-public class ExportJvmInfoTest {
+public class ExportJvmInfoTest extends PrometheusMetricsTestBase {
 
     @Test
     public void exportInfo() throws Exception {
@@ -40,7 +38,6 @@ public class ExportJvmInfoTest {
     }
 
     private void runTest(boolean exportJvmInfo) throws Exception {
-        CollectorRegistry.defaultRegistry.clear();
         PrometheusMetricsProvider provider = new PrometheusMetricsProvider();
         try {
             Properties configuration = new Properties();
@@ -48,7 +45,7 @@ public class ExportJvmInfoTest {
             configuration.setProperty("exportJvmInfo", exportJvmInfo + "");
             provider.configure(configuration);
             provider.start();
-            boolean[] found = {false};
+            boolean[] found = { false };
             provider.dump((k, v) -> {
                 found[0] = found[0] || k.contains("heap");
             });

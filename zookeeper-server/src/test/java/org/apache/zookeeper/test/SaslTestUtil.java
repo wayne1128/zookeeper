@@ -18,7 +18,7 @@
 
 package org.apache.zookeeper.test;
 
-import static org.junit.Assert.fail;
+import static org.junit.jupiter.api.Assertions.fail;
 import java.io.File;
 import java.io.FileWriter;
 import java.io.IOException;
@@ -28,6 +28,7 @@ public class SaslTestUtil extends ClientBase {
     // The maximum time (in milliseconds) a client should take to observe
     // a disconnect event of the same client from server.
     static Integer CLIENT_DISCONNECT_TIMEOUT = 3000;
+    static String SUPER_USER_NAME = "super";
     static String requireSASLAuthProperty = "zookeeper.sessionRequireClientSASLAuth";
     static String authProviderProperty = "zookeeper.authProvider.1";
     static String authProvider = "org.apache.zookeeper.server.auth.SASLAuthenticationProvider";
@@ -35,28 +36,25 @@ public class SaslTestUtil extends ClientBase {
     static String jaasConfig = "java.security.auth.login.config";
 
     static String createJAASConfigFile(String fileName, String password) {
+        return createJAASConfigFile(fileName, SUPER_USER_NAME, password);
+    }
+
+    static String createJAASConfigFile(String fileName, String userName, String password) {
         String ret = null;
         try {
             File tmpDir = createTmpDir();
             File jaasFile = new File(tmpDir, fileName);
             FileWriter fwriter = new FileWriter(jaasFile);
             fwriter.write(""
-                                  + "Server {\n"
-                                  + "          "
-                                  + digestLoginModule
-                                  + " required\n"
-                                  + "          user_super=\"test\";\n"
-                                  + "};\n"
-                                  + "Client {\n"
-                                  + "       "
-                                  + digestLoginModule
-                                  + " required\n"
-                                  + "       username=\"super\"\n"
-                                  + "       password=\""
-                                  + password
-                                  + "\";\n"
-                                  + "};"
-                                  + "\n");
+                    + "Server {\n"
+                    + "          " + digestLoginModule + " required\n"
+                    + "          user_super=\"test\";\n"
+                    + "};\n"
+                    + "Client {\n"
+                    + "       " + digestLoginModule + " required\n"
+                    + "       username=\"" + userName + "\"\n"
+                    + "       password=\"" + password + "\";\n"
+                    + "};" + "\n");
             fwriter.close();
             ret = jaasFile.getAbsolutePath();
         } catch (IOException e) {

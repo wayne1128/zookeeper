@@ -19,10 +19,9 @@
 package org.apache.zookeeper.cli;
 
 import org.apache.commons.cli.CommandLine;
+import org.apache.commons.cli.DefaultParser;
 import org.apache.commons.cli.Options;
 import org.apache.commons.cli.ParseException;
-import org.apache.commons.cli.Parser;
-import org.apache.commons.cli.PosixParser;
 import org.apache.zookeeper.KeeperException;
 import org.apache.zookeeper.data.Stat;
 
@@ -36,18 +35,20 @@ public class GetCommand extends CliCommand {
     private CommandLine cl;
 
     static {
-        options.addOption("s", false, "stats");
-        options.addOption("w", false, "watch");
+        options.addOption("s", false, "Print znode stats additionally");
+        options.addOption("w", false, "Watch for changes on the znode");
+        options.addOption("b", false, "Output data in base64 format");
+        options.addOption("x", false, "Output data in hexdump format");
     }
 
     public GetCommand() {
-        super("get", "[-s] [-w] path");
+        super("get", "[-s] [-w] [-b] [-x] path", options);
     }
 
     @Override
     public CliCommand parse(String[] cmdArgs) throws CliParseException {
 
-        Parser parser = new PosixParser();
+        DefaultParser parser = new DefaultParser();
         try {
             cl = parser.parse(options, cmdArgs);
         } catch (ParseException ex) {
@@ -69,7 +70,7 @@ public class GetCommand extends CliCommand {
             // rewrite to option
             cmdArgs[2] = "-w";
             err.println("'get path [watch]' has been deprecated. " + "Please use 'get [-s] [-w] path' instead.");
-            Parser parser = new PosixParser();
+            DefaultParser parser = new DefaultParser();
             try {
                 cl = parser.parse(options, cmdArgs);
             } catch (ParseException ex) {
@@ -90,10 +91,17 @@ public class GetCommand extends CliCommand {
         } catch (IllegalArgumentException ex) {
             throw new MalformedPathException(ex.getMessage());
         } catch (KeeperException | InterruptedException ex) {
-            throw new CliException(ex);
+            throw new CliWrapperException(ex);
+        }
+        OutputFormatter formatter = PlainOutputFormatter.INSTANCE;
+        if (cl.hasOption("b")) {
+            formatter = Base64OutputFormatter.INSTANCE;
+        }
+        if (cl.hasOption("x")) {
+            formatter = HexDumpOutputFormatter.INSTANCE;
         }
         data = (data == null) ? "null".getBytes() : data;
-        out.println(new String(data));
+        out.println(formatter.format(data));
         if (cl.hasOption("s")) {
             new StatPrinter(out).print(stat);
         }
